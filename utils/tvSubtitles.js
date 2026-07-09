@@ -16,38 +16,29 @@ function randomSleep(min = 4000, max = 6000) {
   return sleep(delay);
 }
 
-// Function to build Zip url from title
-function buildZipUrlFromTitle(title) {
-  // 1. Remove parentheses
-  console.log("Title: " + title);
-  const clean = title.replace(/[()]/g, "").trim();
-  console.log("Cleaned Title: " + clean);
-
-  // 2. Use regex to split the title into showName, episode, and release
-  const match = clean.match(/^(.+?)\s+(\d+x\d+)\s+(.+)$/);
-  if (!match) {
-    console.warn("⚠️ Unexpected title format. Using fallback.");
-    const fallback = clean.replace(/\s+/g, "_") + ".en.zip";
-    return `https://www.tvsubtitles.net/files/${fallback}`;
+// tvsubtitles.net drops connections outright fairly often (ECONNRESET,
+// regardless of which step in the chain), so every request against it goes
+// through this retry wrapper rather than a bare fetch.
+async function fetchWithRetry(url, options, attempts = 3) {
+  let lastError;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.ok) return res;
+      lastError = new Error(`Request failed with status ${res.status}`);
+    } catch (err) {
+      lastError = err;
+    }
+    if (i < attempts - 1) await sleep(500 * (i + 1));
   }
-
-  const [showTitle, showName, episodeCode, releaseInfo] = match;
-  console.log("Show Title", showTitle);
-  console.log("Show Name", showName);
-  console.log("Episode Code", episodeCode);
-  console.log("Release info", releaseInfo);
-
-  const fileName = `${showName}_${episodeCode}_${releaseInfo}.en.zip`;
-
-  // 3. Return encoded full URL
-  return `https://www.tvsubtitles.net/files/${encodeURIComponent(fileName)}`;
+  throw lastError;
 }
 
 // tvsubtitles.net's search form used to post to /search.php; it now posts
 // to /search1.php (the old path 404s).
 async function searchTVShow(title) {
   try {
-    const searchRes = await fetch("https://www.tvsubtitles.net/search1.php", {
+    const searchRes = await fetchWithRetry("https://www.tvsubtitles.net/search1.php", {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -79,18 +70,14 @@ async function searchTVShow(title) {
 }
 
 // An episode page can list several English subtitle entries (different
-// uploaders/releases). Picking only the first one is unreliable: a listing
-// with no "(RELEASE)" tag in its title (e.g. "The Office 1x01") doesn't
-// match buildZipUrlFromTitle's expected "name NxE release" shape, so the
-// guessed .zip 404s even though a same-episode entry with a release tag
-// (e.g. "The Office 1x01 (HDTV)") would have worked. Return every
-// candidate, tag-bearing ones first, so the caller can try each in turn.
+// uploaders/releases) — return them all so the caller can fall through to
+// the next one if the first's download page turns out to be broken.
 async function getSubtitleCandidates(episodePageId) {
   try {
     const url = `https://www.tvsubtitles.net/episode-${episodePageId}-en.html`;
     console.log("📄 Fetching episode page:", url);
 
-    const res = await fetch(url, {
+    const res = await fetchWithRetry(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         Accept:
@@ -126,12 +113,6 @@ async function getSubtitleCandidates(episodePageId) {
       return [];
     }
 
-    candidates.sort((a, b) => {
-      const aHasTag = /\([^)]+\)/.test(a.subtitleTitle) ? 1 : 0;
-      const bHasTag = /\([^)]+\)/.test(b.subtitleTitle) ? 1 : 0;
-      return bHasTag - aHasTag;
-    });
-
     console.log(
       "✅ Subtitle candidates:",
       candidates.map((c) => `${c.subtitleId}:${c.subtitleTitle}`).join(", ")
@@ -147,7 +128,7 @@ async function getSubtitleCandidates(episodePageId) {
 async function getEpisodePageId(showId, seasonNumber, episodeNumber) {
   try {
     const url = `https://www.tvsubtitles.net/tvshow-${showId}-${seasonNumber}.html`;
-    const res = await fetch(url, {
+    const res = await fetchWithRetry(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         Accept:
@@ -156,8 +137,6 @@ async function getEpisodePageId(showId, seasonNumber, episodeNumber) {
         Connection: "keep-alive",
       },
     });
-
-    if (!res.ok) throw new Error("Failed to fetch season page");
 
     const html = await res.text();
     const $ = cheerio.load(html);
@@ -197,43 +176,31 @@ async function getEpisodePageId(showId, seasonNumber, episodeNumber) {
   }
 }
 
-// Function to return subtitle download link from Subtitle Page (Optional)
-async function getActualFilenameFromSubtitlePage(subtitleId) {
+// The download-N.html page doesn't link straight to the zip — it's a
+// timed JS redirect that assembles the real path from several string
+// literals in document order (e.g. 'fil' + 'es/T' + 'he' + ' Office_1x05_en.zip'),
+// presumably to make the file URL harder to scrape/guess directly. This
+// replaces the old approach of guessing the zip filename from the listing
+// title, which broke whenever a listing had no "(RELEASE)" tag to work
+// from — this reads the real path straight from the source instead.
+async function resolveZipUrlFromDownloadPage(subtitleId) {
   try {
-    const url = `https://www.tvsubtitles.net/subtitle-${subtitleId}.html`;
-    const res = await fetch(url, {
+    const url = `https://www.tvsubtitles.net/download-${subtitleId}.html`;
+    const res = await fetchWithRetry(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        Connection: "keep-alive",
+        Referer: `https://www.tvsubtitles.net/subtitle-${subtitleId}.html`,
       },
     });
-
-    if (!res.ok) throw new Error("Failed to fetch subtitle page");
-
     const html = await res.text();
-    const $ = cheerio.load(html);
 
-    let filename = null;
+    const parts = [...html.matchAll(/var\s+s\d+\s*=\s*'([^']*)'/g)].map((m) => m[1]);
+    if (!parts.length) return null;
 
-    $(".subtitle_grid div").each((i, el) => {
-      const label = $(el).text().trim().toLowerCase();
-      if (label === "filename:") {
-        const value = $(el).next().text().trim();
-        filename = value;
-      }
-    });
-
-    if (!filename) {
-      console.warn("⚠️ Could not find filename on subtitle page");
-      return null;
-    }
-
-    return filename;
+    const relativePath = parts.join("").replace(/^\/+/, "");
+    return `https://www.tvsubtitles.net/${relativePath}`;
   } catch (err) {
-    console.error("❌ Subtitle Download Page Scrape Error:", err.message);
+    console.error(`❌ Download page fetch failed: ${err.message}`);
     return null;
   }
 }
@@ -246,39 +213,6 @@ function streamToString(stream) {
     stream.on("end", () => resolve(result));
     stream.on("error", reject);
   });
-}
-
-// New helper to extract release part from filename
-function extractReleaseFromFilename(filename) {
-  const hyphenParts = filename.split(" - ");
-  const lastPart = hyphenParts[2] || "";
-
-  // Remove .en.srt or .srt
-  const noExt = lastPart.replace(/\.en\.srt$|\.srt$/, "").trim();
-
-  const parts = noExt.split(".");
-  const hasResolution = parts.some((p) => /\d{3,4}p/.test(p));
-
-  if (hasResolution) {
-    // e.g. 720p HDTV.LOL
-    const resIndex = parts.findIndex((p) => /\d{3,4}p/.test(p));
-    const releaseParts = parts.slice(resIndex);
-    const [res, rip, group] = releaseParts;
-
-    if (group) return `${res} ${rip}.${group}`;
-    if (rip) return `${res} ${rip}`;
-    return res;
-  } else {
-    // No resolution
-    const last = parts[parts.length - 1];
-    const secondLast = parts[parts.length - 2];
-
-    if (secondLast && secondLast !== last) {
-      return `${secondLast}.${last}`;
-    } else {
-      return last; // e.g. "WEB"
-    }
-  }
 }
 
 // Callers (e.g. the vaplayer scrape) hand us titles like "The Office (US)
@@ -294,9 +228,7 @@ function cleanShowTitle(title) {
 }
 
 async function downloadZipToSrtBuffer(zipUrl) {
-  const zipRes = await fetch(zipUrl);
-  if (!zipRes.ok) throw new Error("Failed to download subtitle ZIP");
-
+  const zipRes = await fetchWithRetry(zipUrl);
   const zipBuffer = await zipRes.buffer();
   const zip = new AdmZip(zipBuffer);
   const srtEntry = zip
@@ -327,44 +259,11 @@ async function downloadAndConvertToVTT(zipUrl) {
 
 async function isZipUrlReachable(zipUrl) {
   try {
-    const res = await fetch(zipUrl, { method: "HEAD" });
-    return res.ok;
+    await fetchWithRetry(zipUrl, { method: "HEAD" }, 2);
+    return true;
   } catch {
     return false;
   }
-}
-
-async function buildZipUrlForCandidate(subtitleId, subtitleTitle) {
-  const actualFilename = await getActualFilenameFromSubtitlePage(subtitleId);
-  let finalTitle = subtitleTitle;
-
-  if (actualFilename) {
-    const correctRelease = extractReleaseFromFilename(actualFilename);
-
-    const match = subtitleTitle.match(/\(([^)]+)\)/);
-    const currentRelease = match ? match[1] : null;
-
-    if (currentRelease) {
-      if (currentRelease.includes(".") || currentRelease.includes(" ")) {
-        if (currentRelease !== correctRelease) {
-          console.log(
-            `🔁 Replacing incorrect release: (${currentRelease}) ➡ ${correctRelease}`
-          );
-          finalTitle = subtitleTitle.replace(
-            /\([^)]+\)/,
-            `(${correctRelease})`
-          );
-        } else {
-          finalTitle = subtitleTitle;
-        }
-      } else {
-        // Single word release (like "WEB") — replace regardless
-        finalTitle = subtitleTitle.replace(/\([^)]+\)/, `(${currentRelease})`);
-      }
-    }
-  }
-
-  return buildZipUrlFromTitle(finalTitle);
 }
 
 async function resolveTVSubtitleZipUrl(title, season, episode) {
@@ -378,13 +277,12 @@ async function resolveTVSubtitleZipUrl(title, season, episode) {
   const candidates = await getSubtitleCandidates(episodeId);
   if (!candidates.length) return null;
 
-  // Not every listing's title yields a real .zip (some lack a "(RELEASE)"
-  // tag, which makes the guessed filename wrong) — verify each candidate
-  // and fall through to the next until one actually exists.
-  for (const { subtitleId, subtitleTitle } of candidates) {
+  // A listing's download page can occasionally be broken/removed even
+  // though it's listed — fall through to the next candidate if so.
+  for (const { subtitleId } of candidates) {
     await randomSleep();
-    const zipUrl = await buildZipUrlForCandidate(subtitleId, subtitleTitle);
-    await randomSleep();
+    const zipUrl = await resolveZipUrlFromDownloadPage(subtitleId);
+    if (!zipUrl) continue;
     console.log("📦 Trying Zip URL:", zipUrl);
 
     if (await isZipUrlReachable(zipUrl)) return zipUrl;
@@ -395,19 +293,24 @@ async function resolveTVSubtitleZipUrl(title, season, episode) {
 }
 
 export async function getTVSubtitleVTT(title, season, episode) {
-  const zipUrl = await resolveTVSubtitleZipUrl(title, season, episode);
-  if (!zipUrl) return null;
-  return await downloadAndConvertToVTT(zipUrl);
+  try {
+    const zipUrl = await resolveTVSubtitleZipUrl(title, season, episode);
+    if (!zipUrl) return null;
+    return await downloadAndConvertToVTT(zipUrl);
+  } catch (err) {
+    console.error("❌ getTVSubtitleVTT failed:", err.message);
+    return null;
+  }
 }
 
 export async function getTVSubtitleSRT(title, season, episode) {
-  const zipUrl = await resolveTVSubtitleZipUrl(title, season, episode);
-  if (!zipUrl) return null;
   try {
+    const zipUrl = await resolveTVSubtitleZipUrl(title, season, episode);
+    if (!zipUrl) return null;
     const srtBuffer = await downloadZipToSrtBuffer(zipUrl);
     return decodeSubtitleBuffer(srtBuffer);
   } catch (err) {
-    console.error("❌ SRT extraction error:", err.message);
+    console.error("❌ getTVSubtitleSRT failed:", err.message);
     return null;
   }
 }

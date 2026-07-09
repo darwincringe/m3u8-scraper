@@ -2,7 +2,7 @@ import express, { json } from "express";
 import cors from "cors";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
-import { getTVSubtitleVTT } from "./utils/tvSubtitles.js";
+import { getTVSubtitleVTT, getTVSubtitleSRT } from "./utils/tvSubtitles.js";
 import {
   findEnglishSubtitleZips,
   downloadZipSubtitleAsVTT,
@@ -233,6 +233,7 @@ app.get("/extract", async (req, res) => {
         subtitleLookupFailed = true;
       }
     } else if (type === "tv" && subtitles.length === 0 && result.title) {
+      let addic7edFailed = false;
       try {
         const candidates = await findTVSubtitleCandidates(result.title, season, episode, 10);
         subtitles = candidates.map(
@@ -241,7 +242,21 @@ app.get("/extract", async (req, res) => {
         );
       } catch (err) {
         console.error("[extract] addic7ed subtitle fallback failed:", err.message);
-        subtitleLookupFailed = true;
+        addic7edFailed = true;
+      }
+
+      // addic7ed is a single third-party site and occasionally rate-limits
+      // us outright (503s on every search, even unrelated ones) — fall back
+      // to the tvsubtitles.net scraper so a single site being down doesn't
+      // mean zero subtitles. That chain takes 30-90s (deliberate anti-bot
+      // delays plus a slow site), far too long to resolve inline here, so
+      // this is a lazy, unverified URL — resolved only when actually
+      // requested, same tradeoff the original tvsubtitles.net-only design
+      // accepted.
+      if (subtitles.length === 0 && addic7edFailed) {
+        subtitles = [
+          `${req.protocol}://${req.get("host")}/tv-subtitle-srt-fallback?title=${encodeURIComponent(result.title)}&season=${season}&episode=${episode}`,
+        ];
       }
     }
 
@@ -440,6 +455,27 @@ app.get("/tv-subtitle-srt", async (req, res) => {
     res.send(srt);
   } catch (err) {
     console.error("[tv-subtitle-srt] Error:", err.message);
+    res.status(500).send("Failed to fetch subtitle");
+  }
+});
+
+/**
+ * tvsubtitles.net fallback (used when addic7ed fails) — lazy, since the
+ * full lookup chain takes 30-90s and would stall /extract if run inline.
+ */
+app.get("/tv-subtitle-srt-fallback", async (req, res) => {
+  const { title, season, episode } = req.query;
+  if (!title || !season || !episode) {
+    return res.status(400).send("Missing title, season, or episode param");
+  }
+
+  try {
+    const srt = await getTVSubtitleSRT(title, season, episode);
+    if (!srt) return res.status(404).send("No subtitle found");
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.send(srt);
+  } catch (err) {
+    console.error("[tv-subtitle-srt-fallback] Error:", err.message);
     res.status(500).send("Failed to fetch subtitle");
   }
 });
