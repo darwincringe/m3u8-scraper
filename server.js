@@ -183,16 +183,44 @@ app.get("/hls-proxy", async (req, res) => {
 
     if (isPlaylist) {
       const buf = Buffer.from(await upstream.arrayBuffer());
-      if (buf.toString("utf8", 0, 7) === "#EXTM3U") {
+      const text = buf.toString("utf8");
+      if (text.startsWith("#EXTM3U")) {
         const baseUrl = new URL(target);
-        const rewritten = buf
-          .toString("utf8")
+        const isMaster = text.includes("#EXT-X-STREAM-INF");
+        const isVariant = req.query.variant === "1";
+
+        // Most titles hand back a master playlist (multi-quality, with
+        // #EXT-X-STREAM-INF), but some — e.g. brand-new single-quality
+        // releases — return a bare *media* playlist directly. Several players
+        // only initialise their pipeline from a master and just show a black
+        // screen (no error) for a raw media playlist. So when we get a bare
+        // media playlist at the top level (no &variant flag yet), wrap it in a
+        // minimal synthetic master pointing back at itself with &variant=1, so
+        // every stream we serve has the same master -> media -> segment shape.
+        if (!isMaster && !isVariant) {
+          const selfUrl = `/hls-proxy?url=${encodeURIComponent(target)}&variant=1`;
+          const master = [
+            "#EXTM3U",
+            "#EXT-X-INDEPENDENT-SEGMENTS",
+            "#EXT-X-STREAM-INF:BANDWIDTH=3000000",
+            selfUrl,
+          ].join("\n");
+          res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+          return res.send(master);
+        }
+
+        // Rewrite child URLs back through this proxy. Variant playlists inside
+        // a master keep the &variant flag so the follow-up request is served
+        // as media (and not wrapped again); segment URLs in a media playlist
+        // need no flag.
+        const childSuffix = isMaster ? "&variant=1" : "";
+        const rewritten = text
           .split("\n")
           .map((line) => {
             const trimmed = line.trim();
             if (!trimmed || trimmed.startsWith("#")) return line;
             const absoluteUrl = new URL(trimmed, baseUrl).toString();
-            return `/hls-proxy?url=${encodeURIComponent(absoluteUrl)}`;
+            return `/hls-proxy?url=${encodeURIComponent(absoluteUrl)}${childSuffix}`;
           })
           .join("\n");
 
