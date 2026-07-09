@@ -223,7 +223,7 @@ app.get("/extract", async (req, res) => {
     let subtitleLookupFailed = false;
     if (type === "movie" && subtitles.length === 0 && result.imdb_id) {
       try {
-        const candidates = await findEnglishSubtitleZips(result.imdb_id, 3);
+        const candidates = await findEnglishSubtitleZips(result.imdb_id, 10);
         subtitles = candidates.map(
           ({ zipUrl, release }) =>
             `${req.protocol}://${req.get("host")}/movie-subtitle-srt?url=${encodeURIComponent(zipUrl)}&release=${encodeURIComponent(release)}`
@@ -234,7 +234,7 @@ app.get("/extract", async (req, res) => {
       }
     } else if (type === "tv" && subtitles.length === 0 && result.title) {
       try {
-        const candidates = await findTVSubtitleCandidates(result.title, season, episode, 3);
+        const candidates = await findTVSubtitleCandidates(result.title, season, episode, 10);
         subtitles = candidates.map(
           ({ downloadUrl, release }) =>
             `${req.protocol}://${req.get("host")}/tv-subtitle-srt?url=${encodeURIComponent(downloadUrl)}&release=${encodeURIComponent(release)}`
