@@ -12,6 +12,10 @@ import {
   findTVSubtitleCandidates,
   downloadSubtitleSRT,
 } from "./utils/addic7edSubtitles.js";
+import {
+  findWyzieTVSubtitleCandidates,
+  downloadWyzieSubtitleSRT,
+} from "./utils/wyzieSubtitles.js";
 dotenv.config();
 
 const app = express();
@@ -232,17 +236,35 @@ app.get("/extract", async (req, res) => {
         console.error("[extract] YIFY subtitle fallback failed:", err.message);
         subtitleLookupFailed = true;
       }
-    } else if (type === "tv" && subtitles.length === 0 && result.title) {
-      let addic7edFailed = false;
+    } else if (type === "tv" && subtitles.length === 0) {
+      // Primary TV source: Wyzie (series-only). Keyed on tmdb_id (always
+      // present) and internally cached for 24h, so popular episodes are
+      // looked up from Wyzie's API at most once a day — keeping us under the
+      // account's 1000 requests/day cap even across many viewers and
+      // back-navigation.
       try {
-        const candidates = await findTVSubtitleCandidates(result.title, season, episode, 10);
-        subtitles = candidates.map(
+        const wyzieCandidates = await findWyzieTVSubtitleCandidates(tmdb_id, season, episode, 10);
+        subtitles = wyzieCandidates.map(
           ({ downloadUrl, release }) =>
-            `${req.protocol}://${req.get("host")}/tv-subtitle-srt?url=${encodeURIComponent(downloadUrl)}&release=${encodeURIComponent(release)}`
+            `${req.protocol}://${req.get("host")}/wyzie-subtitle-srt?url=${encodeURIComponent(downloadUrl)}&release=${encodeURIComponent(release)}`
         );
       } catch (err) {
-        console.error("[extract] addic7ed subtitle fallback failed:", err.message);
-        addic7edFailed = true;
+        console.error("[extract] Wyzie subtitle lookup failed:", err.message);
+      }
+
+      // Fall back to the addic7ed scraper only if Wyzie found nothing.
+      let addic7edFailed = false;
+      if (subtitles.length === 0 && result.title) {
+        try {
+          const candidates = await findTVSubtitleCandidates(result.title, season, episode, 10);
+          subtitles = candidates.map(
+            ({ downloadUrl, release }) =>
+              `${req.protocol}://${req.get("host")}/tv-subtitle-srt?url=${encodeURIComponent(downloadUrl)}&release=${encodeURIComponent(release)}`
+          );
+        } catch (err) {
+          console.error("[extract] addic7ed subtitle fallback failed:", err.message);
+          addic7edFailed = true;
+        }
       }
 
       // addic7ed is a single third-party site and occasionally rate-limits
@@ -439,6 +461,26 @@ app.get("/tv-subtitles", async (req, res) => {
   } catch (err) {
     console.error("❌ Subtitle API Error:", err.message);
     res.status(500).send("Internal server error");
+  }
+});
+
+/**
+ * Wyzie subtitle download URL -> raw .srt proxy (TV). The resolved URLs point
+ * at opensubtitles.org, which we can't expose to the browser directly (no
+ * CORS, Cloudflare), so we proxy + decode server-side. Downloads are cached
+ * by URL in the Wyzie module.
+ */
+app.get("/wyzie-subtitle-srt", async (req, res) => {
+  const downloadUrl = req.query.url;
+  if (!downloadUrl) return res.status(400).send("Missing url param");
+
+  try {
+    const srt = await downloadWyzieSubtitleSRT(downloadUrl);
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.send(srt);
+  } catch (err) {
+    console.error("[wyzie-subtitle-srt] Error:", err.message);
+    res.status(500).send("Failed to fetch subtitle");
   }
 });
 
