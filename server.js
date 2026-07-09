@@ -63,6 +63,21 @@ async function pickReachableStreamUrl(streamUrls, timeoutMs = 5000) {
   return null;
 }
 
+// vidapi.cloud subtitle URLs end in a descriptive filename like
+// ".../Brazilian.por.srt". Downstream consumers key on a `release` query
+// param, so derive it from that filename (sans .srt) and append it.
+function appendReleaseParam(url) {
+  try {
+    const filename = url.split("?")[0].split("/").pop() || "";
+    const release = filename.replace(/\.srt$/i, "");
+    if (!release) return url;
+    const sep = url.includes("?") ? "&" : "?";
+    return `${url}${sep}release=${encodeURIComponent(release)}`;
+  } catch {
+    return url;
+  }
+}
+
 // vaplayer.ru exposes its stream data through a plain JSON API
 // (streamdata.vaplayer.ru). Its embed page's own JS aborts this same
 // request when it detects a CDP/debugger connection (i.e. any Playwright
@@ -102,6 +117,7 @@ async function scrapeVaplayerAPI(type, tmdb_id, season, episode) {
       ? json.default_subs
           .map((s) => (typeof s === "string" ? s : s?.url))
           .filter(Boolean)
+          .map(appendReleaseParam)
       : [];
 
     return {
