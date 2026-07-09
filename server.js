@@ -172,32 +172,55 @@ app.get("/hls-proxy", async (req, res) => {
   try {
     const upstream = await fetchUpstreamWithRetry(target);
 
-    const buf = Buffer.from(await upstream.arrayBuffer());
+    // Playlists (.m3u8) are small and must be buffered so their segment URLs
+    // can be rewritten to point back at this proxy. The CDN mislabels
+    // Content-Type, so detect by path extension (playlists here are always
+    // named *.m3u8; every other resource is a media segment).
+    let isPlaylist = false;
+    try {
+      isPlaylist = new URL(target).pathname.toLowerCase().endsWith(".m3u8");
+    } catch {}
 
-    if (buf.toString("utf8", 0, 7) === "#EXTM3U") {
-      const baseUrl = new URL(target);
-      const rewritten = buf
-        .toString("utf8")
-        .split("\n")
-        .map((line) => {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith("#")) return line;
-          const absoluteUrl = new URL(trimmed, baseUrl).toString();
-          return `/hls-proxy?url=${encodeURIComponent(absoluteUrl)}`;
-        })
-        .join("\n");
+    if (isPlaylist) {
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      if (buf.toString("utf8", 0, 7) === "#EXTM3U") {
+        const baseUrl = new URL(target);
+        const rewritten = buf
+          .toString("utf8")
+          .split("\n")
+          .map((line) => {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith("#")) return line;
+            const absoluteUrl = new URL(trimmed, baseUrl).toString();
+            return `/hls-proxy?url=${encodeURIComponent(absoluteUrl)}`;
+          })
+          .join("\n");
 
-      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-      return res.send(rewritten);
+        res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+        return res.send(rewritten);
+      }
+      // Extension said .m3u8 but the body isn't a playlist — serve as-is.
+      res.setHeader("Content-Type", "video/mp2t");
+      return res.send(buf);
     }
 
     // Media segment: force the correct MIME type regardless of what the
-    // upstream CDN claims.
+    // upstream CDN claims, and STREAM it straight through. Buffering whole
+    // segments (some 6MB+ on slow mirrors) delayed the first byte to the
+    // player by several seconds, tripping native-player segment timeouts and
+    // showing a black screen for titles served by slower mirrors.
     res.setHeader("Content-Type", "video/mp2t");
-    res.send(buf);
+    const contentLength = upstream.headers.get("content-length");
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+
+    upstream.body.on("error", (err) => {
+      console.error("[hls-proxy] Segment stream error:", err.message);
+      res.destroy(err);
+    });
+    upstream.body.pipe(res);
   } catch (err) {
     console.error("[hls-proxy] Error:", err.message);
-    res.status(500).send("Proxy error");
+    if (!res.headersSent) res.status(500).send("Proxy error");
   }
 });
 
