@@ -2,7 +2,12 @@ import express, { json } from "express";
 import cors from "cors";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
-import { getTVSubtitleVTT } from "./utils/tvSubtitles.js";
+import { getTVSubtitleVTT, getTVSubtitleSRT } from "./utils/tvSubtitles.js";
+import {
+  findEnglishSubtitleZip,
+  downloadZipSubtitleAsVTT,
+  downloadZipSubtitleAsSRT,
+} from "./utils/movieSubtitles.js";
 dotenv.config();
 
 const app = express();
@@ -27,6 +32,28 @@ export const COMMON_LANGUAGES = Object.keys(LANGUAGE_NAMES);
 
 // Simple in-memory cache to avoid re-fetching same query repeatedly (15 minutes)
 const cache = new Map();
+
+// The CDN mirrors vaplayer.ru hands out are short-lived and occasionally
+// dead on arrival, so we can't trust stream_urls[0] blindly — probe each
+// candidate and use the first one that actually responds.
+async function pickReachableStreamUrl(streamUrls, timeoutMs = 5000) {
+  for (const url of streamUrls) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        headers: { Referer: "https://nextgencloudfabric.com/" },
+        signal: controller.signal,
+      });
+      if (res.ok) return url;
+    } catch {
+      // unreachable, try the next mirror
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  return null;
+}
 
 // vaplayer.ru exposes its stream data through a plain JSON API
 // (streamdata.vaplayer.ru). Its embed page's own JS aborts this same
@@ -58,17 +85,54 @@ async function scrapeVaplayerAPI(type, tmdb_id, season, episode) {
       throw new Error("No stream URLs returned");
     }
 
+    const workingUrl = await pickReachableStreamUrl(streamUrls);
+    if (!workingUrl) {
+      throw new Error("All stream mirrors are unreachable");
+    }
+
     const subtitles = Array.isArray(json.default_subs)
       ? json.default_subs
           .map((s) => (typeof s === "string" ? s : s?.url))
           .filter(Boolean)
       : [];
 
-    return { hls_url: streamUrls[0], subtitles, error: null };
+    return {
+      hls_url: workingUrl,
+      subtitles,
+      imdb_id: json?.data?.imdb_id || null,
+      title: json?.data?.title || null,
+      error: null,
+    };
   } catch (error) {
     console.error(`Error: ${error.message}`);
-    return { hls_url: null, subtitles: [], error: error.message };
+    return {
+      hls_url: null,
+      subtitles: [],
+      imdb_id: null,
+      title: null,
+      error: error.message,
+    };
   }
+}
+
+// Some CDN mirrors (e.g. startupscalingsystem.website) intermittently drop
+// connections on individual segment requests. Retry a couple of times
+// before giving up, since one dropped connection shouldn't kill playback.
+async function fetchUpstreamWithRetry(target, attempts = 3) {
+  let lastError;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const upstream = await fetch(target, {
+        headers: { Referer: "https://nextgencloudfabric.com/" },
+      });
+      if (upstream.ok) return upstream;
+      lastError = new Error(`Upstream fetch failed with status ${upstream.status}`);
+    } catch (err) {
+      lastError = err;
+    }
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, 200 * (i + 1)));
+  }
+  throw lastError;
 }
 
 // vaplayer.ru's CDN mislabels media segments as Content-Type: text/html
@@ -82,13 +146,7 @@ app.get("/hls-proxy", async (req, res) => {
   if (!target) return res.status(400).send("Missing url param");
 
   try {
-    const upstream = await fetch(target, {
-      headers: { Referer: "https://nextgencloudfabric.com/" },
-    });
-
-    if (!upstream.ok) {
-      return res.status(upstream.status).send("Upstream fetch failed");
-    }
+    const upstream = await fetchUpstreamWithRetry(target);
 
     const buf = Buffer.from(await upstream.arrayBuffer());
 
@@ -157,10 +215,32 @@ app.get("/extract", async (req, res) => {
       ? `${req.protocol}://${req.get("host")}/hls-proxy?url=${encodeURIComponent(result.hls_url)}`
       : null;
 
+    let subtitles = result.subtitles;
+    if (type === "movie" && subtitles.length === 0 && result.imdb_id) {
+      try {
+        const zipUrl = await findEnglishSubtitleZip(result.imdb_id);
+        if (zipUrl) {
+          subtitles = [
+            `${req.protocol}://${req.get("host")}/movie-subtitle-srt?url=${encodeURIComponent(zipUrl)}`,
+          ];
+        }
+      } catch (err) {
+        console.error("[extract] YIFY subtitle fallback failed:", err.message);
+      }
+    } else if (type === "tv" && subtitles.length === 0 && result.title) {
+      // tvsubtitles.net's own lookup chain takes ~20s (deliberate anti-bot
+      // delays), so unlike the movie path we don't resolve/verify it here —
+      // that would stall the hls_url response. Hand back a lazy URL instead;
+      // it's resolved when /tv-subtitle-srt is actually requested.
+      subtitles = [
+        `${req.protocol}://${req.get("host")}/tv-subtitle-srt?title=${encodeURIComponent(result.title)}&season=${season}&episode=${episode}`,
+      ];
+    }
+
     const response = {
       success: !!result.hls_url,
       hls_url: proxiedHlsUrl,
-      subtitles: result.subtitles,
+      subtitles,
       error: result.error,
     };
 
@@ -333,6 +413,60 @@ app.get("/tv-subtitles", async (req, res) => {
   } catch (err) {
     console.error("❌ Subtitle API Error:", err.message);
     res.status(500).send("Internal server error");
+  }
+});
+
+/**
+ * Raw .srt version of /tv-subtitles (for apps that expect .srt, not .vtt)
+ */
+app.get("/tv-subtitle-srt", async (req, res) => {
+  const { title, season, episode } = req.query;
+  if (!title || !season || !episode) {
+    return res.status(400).send("Missing title, season, or episode param");
+  }
+
+  try {
+    const srt = await getTVSubtitleSRT(title, season, episode);
+    if (!srt) return res.status(404).send("No subtitle found");
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.send(srt);
+  } catch (err) {
+    console.error("[tv-subtitle-srt] Error:", err.message);
+    res.status(500).send("Failed to fetch subtitle");
+  }
+});
+
+/**
+ * YIFY/YTS subtitle zip -> VTT proxy (movies only, no API key needed)
+ */
+app.get("/movie-subtitle-vtt", async (req, res) => {
+  const zipUrl = req.query.url;
+  if (!zipUrl) return res.status(400).send("Missing url param");
+
+  try {
+    const vtt = await downloadZipSubtitleAsVTT(zipUrl);
+    res.setHeader("Content-Type", "text/vtt");
+    res.send(vtt);
+  } catch (err) {
+    console.error("[movie-subtitle-vtt] Error:", err.message);
+    res.status(500).send("Failed to fetch subtitle");
+  }
+});
+
+/**
+ * YIFY/YTS subtitle zip -> raw SRT proxy (movies only, no API key needed)
+ */
+app.get("/movie-subtitle-srt", async (req, res) => {
+  const zipUrl = req.query.url;
+  if (!zipUrl) return res.status(400).send("Missing url param");
+
+  try {
+    const srt = await downloadZipSubtitleAsSRT(zipUrl);
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.send(srt);
+  } catch (err) {
+    console.error("[movie-subtitle-srt] Error:", err.message);
+    res.status(500).send("Failed to fetch subtitle");
   }
 });
 
