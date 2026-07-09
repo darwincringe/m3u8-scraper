@@ -2,12 +2,16 @@ import express, { json } from "express";
 import cors from "cors";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
-import { getTVSubtitleVTT, getTVSubtitleSRT } from "./utils/tvSubtitles.js";
+import { getTVSubtitleVTT } from "./utils/tvSubtitles.js";
 import {
-  findEnglishSubtitleZip,
+  findEnglishSubtitleZips,
   downloadZipSubtitleAsVTT,
   downloadZipSubtitleAsSRT,
 } from "./utils/movieSubtitles.js";
+import {
+  findTVSubtitleCandidates,
+  downloadSubtitleSRT,
+} from "./utils/addic7edSubtitles.js";
 dotenv.config();
 
 const app = express();
@@ -216,25 +220,29 @@ app.get("/extract", async (req, res) => {
       : null;
 
     let subtitles = result.subtitles;
+    let subtitleLookupFailed = false;
     if (type === "movie" && subtitles.length === 0 && result.imdb_id) {
       try {
-        const zipUrl = await findEnglishSubtitleZip(result.imdb_id);
-        if (zipUrl) {
-          subtitles = [
-            `${req.protocol}://${req.get("host")}/movie-subtitle-srt?url=${encodeURIComponent(zipUrl)}`,
-          ];
-        }
+        const candidates = await findEnglishSubtitleZips(result.imdb_id, 3);
+        subtitles = candidates.map(
+          ({ zipUrl }) =>
+            `${req.protocol}://${req.get("host")}/movie-subtitle-srt?url=${encodeURIComponent(zipUrl)}`
+        );
       } catch (err) {
         console.error("[extract] YIFY subtitle fallback failed:", err.message);
+        subtitleLookupFailed = true;
       }
     } else if (type === "tv" && subtitles.length === 0 && result.title) {
-      // tvsubtitles.net's own lookup chain takes ~20s (deliberate anti-bot
-      // delays), so unlike the movie path we don't resolve/verify it here —
-      // that would stall the hls_url response. Hand back a lazy URL instead;
-      // it's resolved when /tv-subtitle-srt is actually requested.
-      subtitles = [
-        `${req.protocol}://${req.get("host")}/tv-subtitle-srt?title=${encodeURIComponent(result.title)}&season=${season}&episode=${episode}`,
-      ];
+      try {
+        const candidates = await findTVSubtitleCandidates(result.title, season, episode, 3);
+        subtitles = candidates.map(
+          ({ downloadUrl }) =>
+            `${req.protocol}://${req.get("host")}/tv-subtitle-srt?url=${encodeURIComponent(downloadUrl)}`
+        );
+      } catch (err) {
+        console.error("[extract] addic7ed subtitle fallback failed:", err.message);
+        subtitleLookupFailed = true;
+      }
     }
 
     const response = {
@@ -244,7 +252,10 @@ app.get("/extract", async (req, res) => {
       error: result.error,
     };
 
-    if (response.success) {
+    // Don't cache a transient subtitle-lookup failure as if it were a
+    // final answer — that would keep serving "no subtitles" for the rest
+    // of the 15-minute window even though a retry would likely succeed.
+    if (response.success && !subtitleLookupFailed) {
       cache.set(cacheKey, {
         timestamp: Date.now(),
         response,
@@ -417,17 +428,14 @@ app.get("/tv-subtitles", async (req, res) => {
 });
 
 /**
- * Raw .srt version of /tv-subtitles (for apps that expect .srt, not .vtt)
+ * addic7ed subtitle download URL -> raw .srt proxy (TV, no API key needed)
  */
 app.get("/tv-subtitle-srt", async (req, res) => {
-  const { title, season, episode } = req.query;
-  if (!title || !season || !episode) {
-    return res.status(400).send("Missing title, season, or episode param");
-  }
+  const downloadUrl = req.query.url;
+  if (!downloadUrl) return res.status(400).send("Missing url param");
 
   try {
-    const srt = await getTVSubtitleSRT(title, season, episode);
-    if (!srt) return res.status(404).send("No subtitle found");
+    const srt = await downloadSubtitleSRT(downloadUrl);
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.send(srt);
   } catch (err) {

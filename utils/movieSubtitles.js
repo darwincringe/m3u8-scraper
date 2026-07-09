@@ -46,7 +46,7 @@ async function extractZipUrl(detailUrl, base) {
   return null;
 }
 
-async function findEnglishSubtitleOnMirror(base, imdb_id) {
+async function findEnglishSubtitlesOnMirror(base, imdb_id, limit) {
   const html = await fetchHtml(`${base}/movie-imdb/${imdb_id}`);
   const $ = cheerio.load(html);
 
@@ -68,31 +68,33 @@ async function findEnglishSubtitleOnMirror(base, imdb_id) {
   // archive can be missing a text subtitle entry entirely — e.g. a
   // VobSub/image-based release) so verify each candidate before trusting it,
   // same principle as the HLS mirror fallback.
+  const found = [];
   for (const candidate of candidates) {
+    if (found.length >= limit) break;
     const zipUrl = await extractZipUrl(candidate.detailUrl, base);
     if (!zipUrl) continue;
     try {
       await extractSrtBufferFromZip(zipUrl);
-      return zipUrl;
+      found.push({ rating: candidate.rating, zipUrl });
     } catch (err) {
       console.error(`[movieSubtitles] candidate ${zipUrl} unusable: ${err.message}`);
     }
   }
-  return null;
+  return found;
 }
 
-// Returns a direct .zip URL for the best-rated (verified working) English
-// subtitle for this IMDb id, or null if none of the mirrors have one.
-export async function findEnglishSubtitleZip(imdb_id) {
+// Returns up to `limit` verified-working English subtitle candidates for
+// this IMDb id, ranked by rating, e.g. [{ rating, zipUrl }, ...].
+export async function findEnglishSubtitleZips(imdb_id, limit = 3) {
   for (const base of MIRRORS) {
     try {
-      const zipUrl = await findEnglishSubtitleOnMirror(base, imdb_id);
-      if (zipUrl) return zipUrl;
+      const found = await findEnglishSubtitlesOnMirror(base, imdb_id, limit);
+      if (found.length) return found;
     } catch (err) {
       console.error(`[movieSubtitles] ${base} failed: ${err.message}`);
     }
   }
-  return null;
+  return [];
 }
 
 // YIFY zips are inconsistently packaged: usually a .srt, but sometimes a
