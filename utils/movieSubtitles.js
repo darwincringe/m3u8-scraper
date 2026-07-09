@@ -4,6 +4,7 @@ import AdmZip from "adm-zip";
 import srt2vtt from "srt-to-vtt";
 import { Readable } from "stream";
 import { decodeSubtitleBuffer } from "./subtitleEncoding.js";
+import { extractReleaseTag } from "./releaseTag.js";
 
 // These are YIFY/YTS subtitle mirrors (same underlying subtitle database),
 // which lines up well with this scraper's sources: the streamed files are
@@ -46,6 +47,18 @@ async function extractZipUrl(detailUrl, base) {
   return null;
 }
 
+async function verifyCandidate(candidate, base) {
+  const zipUrl = await extractZipUrl(candidate.detailUrl, base);
+  if (!zipUrl) return null;
+  try {
+    await extractSrtBufferFromZip(zipUrl);
+    return zipUrl;
+  } catch (err) {
+    console.error(`[movieSubtitles] candidate ${zipUrl} unusable: ${err.message}`);
+    return null;
+  }
+}
+
 async function findEnglishSubtitlesOnMirror(base, imdb_id, limit) {
   const html = await fetchHtml(`${base}/movie-imdb/${imdb_id}`);
   const $ = cheerio.load(html);
@@ -56,10 +69,17 @@ async function findEnglishSubtitlesOnMirror(base, imdb_id, limit) {
     if ($row.find(".sub-lang").text().trim().toLowerCase() !== "english") return;
 
     const rating = parseInt($row.find(".rating-cell .label").text().trim(), 10) || 0;
-    const href = $row.find("td a[href^='/subtitles/']").attr("href");
+    const $link = $row.find("td a[href^='/subtitles/']");
+    const href = $link.attr("href");
     if (!href) return;
 
-    candidates.push({ rating, detailUrl: new URL(href, base).toString() });
+    const releaseText = $link.clone().children("span.text-muted").remove().end().text().trim();
+
+    candidates.push({
+      rating,
+      release: extractReleaseTag(releaseText),
+      detailUrl: new URL(href, base).toString(),
+    });
   });
 
   candidates.sort((a, b) => b.rating - a.rating);
@@ -69,22 +89,40 @@ async function findEnglishSubtitlesOnMirror(base, imdb_id, limit) {
   // VobSub/image-based release) so verify each candidate before trusting it,
   // same principle as the HLS mirror fallback.
   const found = [];
+  const tried = new Set();
+  const usedTags = new Set();
+
+  // Pass 1: one verified candidate per distinct release (BluRay, WEBRip,
+  // HDTV, ...) so choices are actually different, not just the top-N by
+  // rating (which can all be the same release group).
   for (const candidate of candidates) {
     if (found.length >= limit) break;
-    const zipUrl = await extractZipUrl(candidate.detailUrl, base);
-    if (!zipUrl) continue;
-    try {
-      await extractSrtBufferFromZip(zipUrl);
-      found.push({ rating: candidate.rating, zipUrl });
-    } catch (err) {
-      console.error(`[movieSubtitles] candidate ${zipUrl} unusable: ${err.message}`);
+    if (usedTags.has(candidate.release)) continue;
+    tried.add(candidate.detailUrl);
+    const zipUrl = await verifyCandidate(candidate, base);
+    if (zipUrl) {
+      found.push({ rating: candidate.rating, release: candidate.release, zipUrl });
+      usedTags.add(candidate.release);
     }
   }
+
+  // Pass 2: not enough distinct releases available — fill remaining slots
+  // by rating regardless of repeats.
+  for (const candidate of candidates) {
+    if (found.length >= limit) break;
+    if (tried.has(candidate.detailUrl)) continue;
+    const zipUrl = await verifyCandidate(candidate, base);
+    if (zipUrl) {
+      found.push({ rating: candidate.rating, release: candidate.release, zipUrl });
+    }
+  }
+
   return found;
 }
 
 // Returns up to `limit` verified-working English subtitle candidates for
-// this IMDb id, ranked by rating, e.g. [{ rating, zipUrl }, ...].
+// this IMDb id, diversified by release/source where possible, ranked by
+// rating, e.g. [{ rating, release: "BLURAY", zipUrl }, ...].
 export async function findEnglishSubtitleZips(imdb_id, limit = 3) {
   for (const base of MIRRORS) {
     try {

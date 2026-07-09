@@ -1,6 +1,7 @@
 import fetch from "node-fetch";
 import * as cheerio from "cheerio";
 import { decodeSubtitleBuffer } from "./subtitleEncoding.js";
+import { extractReleaseTag } from "./releaseTag.js";
 
 // Not using the `addic7ed-api` npm package here: its HTML regexes were
 // written against an older addic7ed.com markup (looking for `<strong>` tags
@@ -134,6 +135,7 @@ function parseEnglishSubtitles(html) {
 
     results.push({
       version: currentVersion,
+      release: extractReleaseTag(currentVersion),
       downloadUrl: `${BASE_URL}${href}`,
       downloads,
     });
@@ -142,12 +144,37 @@ function parseEnglishSubtitles(html) {
   return results.sort((a, b) => b.downloads - a.downloads);
 }
 
-// Returns up to `limit` English subtitle candidates for an episode, ranked
-// by download count, e.g. [{ version: "LOL", downloadUrl, downloads }, ...]
+// Picks up to `limit` candidates diversified by release/source (BluRay,
+// WEB-DL, HDTV, ...) where available, instead of just the top-N by
+// downloads (which can all be the same release group), falling back to
+// filling remaining slots by downloads if there isn't enough diversity.
+function diversifyByRelease(sortedCandidates, limit) {
+  const found = [];
+  const usedTags = new Set();
+
+  for (const candidate of sortedCandidates) {
+    if (found.length >= limit) break;
+    if (usedTags.has(candidate.release)) continue;
+    found.push(candidate);
+    usedTags.add(candidate.release);
+  }
+
+  for (const candidate of sortedCandidates) {
+    if (found.length >= limit) break;
+    if (found.includes(candidate)) continue;
+    found.push(candidate);
+  }
+
+  return found;
+}
+
+// Returns up to `limit` English subtitle candidates for an episode,
+// diversified by release/source where possible, ranked by download count,
+// e.g. [{ version: "LOL", release: "HDTV", downloadUrl, downloads }, ...]
 export async function findTVSubtitleCandidates(showTitle, season, episode, limit = 3) {
   const html = await resolveEpisodePage(showTitle, season, episode);
   if (!html) return [];
-  return parseEnglishSubtitles(html).slice(0, limit);
+  return diversifyByRelease(parseEnglishSubtitles(html), limit);
 }
 
 export async function downloadSubtitleSRT(downloadUrl) {

@@ -225,8 +225,8 @@ app.get("/extract", async (req, res) => {
       try {
         const candidates = await findEnglishSubtitleZips(result.imdb_id, 3);
         subtitles = candidates.map(
-          ({ zipUrl }) =>
-            `${req.protocol}://${req.get("host")}/movie-subtitle-srt?url=${encodeURIComponent(zipUrl)}`
+          ({ zipUrl, release }) =>
+            `${req.protocol}://${req.get("host")}/movie-subtitle-srt?url=${encodeURIComponent(zipUrl)}&release=${encodeURIComponent(release)}`
         );
       } catch (err) {
         console.error("[extract] YIFY subtitle fallback failed:", err.message);
@@ -236,8 +236,8 @@ app.get("/extract", async (req, res) => {
       try {
         const candidates = await findTVSubtitleCandidates(result.title, season, episode, 3);
         subtitles = candidates.map(
-          ({ downloadUrl }) =>
-            `${req.protocol}://${req.get("host")}/tv-subtitle-srt?url=${encodeURIComponent(downloadUrl)}`
+          ({ downloadUrl, release }) =>
+            `${req.protocol}://${req.get("host")}/tv-subtitle-srt?url=${encodeURIComponent(downloadUrl)}&release=${encodeURIComponent(release)}`
         );
       } catch (err) {
         console.error("[extract] addic7ed subtitle fallback failed:", err.message);
