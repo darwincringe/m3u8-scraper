@@ -311,9 +311,12 @@ app.get("/extract", async (req, res) => {
       // back-navigation.
       try {
         const wyzieCandidates = await findWyzieTVSubtitleCandidates(tmdb_id, season, episode);
+        // Served as the raw opensubtitles.org URL rather than proxied through
+        // our own /wyzie-subtitle-srt: this server's datacenter IP gets
+        // Cloudflare-blocked on that domain, but the viewer's own (residential)
+        // IP fetching it directly is not.
         subtitles = wyzieCandidates.map(
-          ({ downloadUrl, release }) =>
-            `${req.protocol}://${req.get("host")}/wyzie-subtitle-srt?url=${encodeURIComponent(downloadUrl)}&release=${encodeURIComponent(release)}`
+          ({ downloadUrl, release }) => `${downloadUrl}&release=${encodeURIComponent(release)}`
         );
       } catch (err) {
         console.error("[extract] Wyzie subtitle lookup failed:", err.message);
