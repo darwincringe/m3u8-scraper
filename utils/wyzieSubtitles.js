@@ -57,11 +57,19 @@ function diversifyByRelease(sortedCandidates, limit) {
   return found;
 }
 
-// Returns up to `limit` English subtitle candidates for a TV episode,
-// diversified by release and ranked by download count, shaped as
-// [{ downloadUrl, release }, ...] to match the addic7ed/movie candidate
-// consumers in server.js. `id` is a TMDB (or IMDb) id. Cached per episode.
-export async function findWyzieTVSubtitleCandidates(id, season, episode, limit = 10) {
+// English gets more slots since it's the primary/default track; other
+// languages are secondary options and capped tighter to keep the list short.
+const ENGLISH_LIMIT = 5;
+const OTHER_LANGUAGE_LIMIT = 3;
+
+// Returns English + other-language subtitle candidates for a TV episode,
+// diversified by release and ranked by download count within each language,
+// shaped as [{ downloadUrl, release }, ...] (release prefixed with Wyzie's
+// `display` name, e.g. "ENGLISH.BLURAY") to match the addic7ed/movie
+// candidate consumers in server.js. English is always first, followed by
+// the other languages in alphabetical order (by display name). `id` is a
+// TMDB (or IMDb) id. Cached per episode.
+export async function findWyzieTVSubtitleCandidates(id, season, episode) {
   if (!id || season == null || episode == null) return [];
 
   const apiKey = getApiKey();
@@ -70,13 +78,13 @@ export async function findWyzieTVSubtitleCandidates(id, season, episode, limit =
   const cacheKey = `${id}:${season}:${episode}`;
   const cached = searchCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < SEARCH_TTL_MS) {
-    return cached.candidates.slice(0, limit);
+    return cached.candidates;
   }
 
   const url =
     `${WYZIE_SEARCH_URL}?id=${encodeURIComponent(id)}` +
     `&season=${encodeURIComponent(season)}&episode=${encodeURIComponent(episode)}` +
-    `&language=en&key=${encodeURIComponent(apiKey)}`;
+    `&key=${encodeURIComponent(apiKey)}`;
 
   const res = await fetch(url, {
     headers: { "User-Agent": BROWSER_UA, Accept: "application/json" },
@@ -92,31 +100,53 @@ export async function findWyzieTVSubtitleCandidates(id, season, episode, limit =
   // silently dropping every candidate and falling through to the much
   // weaker addic7ed/tvsubtitles.net scrapers.
   const seen = new Set();
-  const candidates = data
+  const usable = data
     .filter(
       (s) =>
         s &&
-        s.language === "en" &&
+        s.display &&
         s.url &&
         (s.format === "srt" || s.format === "ass" || s.format === "ssa")
     )
-    .sort((a, b) => (b.downloadCount || 0) - (a.downloadCount || 0))
+    .filter((s) => {
+      if (seen.has(s.url)) return false;
+      seen.add(s.url);
+      return true;
+    })
     .map((s) => ({
       downloadUrl: s.url,
+      downloadCount: s.downloadCount || 0,
+      display: s.display,
       release: extractReleaseTag(s.release || s.fileName || s.origin || ""),
-    }))
-    .filter((c) => {
-      if (seen.has(c.downloadUrl)) return false;
-      seen.add(c.downloadUrl);
-      return true;
-    });
+    }));
 
-  // Cache the full diversified list (not just `limit`) so a later request
-  // with a larger limit is still served from cache.
-  const diversified = diversifyByRelease(candidates, Math.max(limit, 10));
-  searchCache.set(cacheKey, { timestamp: Date.now(), candidates: diversified });
+  const byDisplay = new Map();
+  for (const candidate of usable) {
+    if (!byDisplay.has(candidate.display)) byDisplay.set(candidate.display, []);
+    byDisplay.get(candidate.display).push(candidate);
+  }
 
-  return diversified.slice(0, limit);
+  const buildLabeled = (list, limit) =>
+    diversifyByRelease(
+      [...list].sort((a, b) => b.downloadCount - a.downloadCount),
+      limit
+    ).map((c) => ({
+      downloadUrl: c.downloadUrl,
+      release: `${c.display.toUpperCase()}.${c.release}`,
+    }));
+
+  const english = buildLabeled(byDisplay.get("English") || [], ENGLISH_LIMIT);
+  byDisplay.delete("English");
+
+  const otherDisplays = [...byDisplay.keys()].sort((a, b) => a.localeCompare(b));
+  const others = otherDisplays.flatMap((display) =>
+    buildLabeled(byDisplay.get(display), OTHER_LANGUAGE_LIMIT)
+  );
+
+  const candidates = [...english, ...others];
+  searchCache.set(cacheKey, { timestamp: Date.now(), candidates });
+
+  return candidates;
 }
 
 // Downloads a Wyzie subtitle URL and returns decoded SRT text. Cached by URL.

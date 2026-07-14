@@ -310,7 +310,7 @@ app.get("/extract", async (req, res) => {
       // account's 1000 requests/day cap even across many viewers and
       // back-navigation.
       try {
-        const wyzieCandidates = await findWyzieTVSubtitleCandidates(tmdb_id, season, episode, 10);
+        const wyzieCandidates = await findWyzieTVSubtitleCandidates(tmdb_id, season, episode);
         subtitles = wyzieCandidates.map(
           ({ downloadUrl, release }) =>
             `${req.protocol}://${req.get("host")}/wyzie-subtitle-srt?url=${encodeURIComponent(downloadUrl)}&release=${encodeURIComponent(release)}`
