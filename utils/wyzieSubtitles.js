@@ -1,6 +1,7 @@
 import fetch from "node-fetch";
 import { decodeSubtitleBuffer } from "./subtitleEncoding.js";
 import { extractReleaseTag } from "./releaseTag.js";
+import { isAssFormat, convertAssToSrt } from "./assToSrt.js";
 
 // Wyzie is a hosted subtitle API (sub.wyzie.io) keyed by TMDB/IMDb id. It's
 // series-friendly (takes season/episode) and returns ready-to-download SRT
@@ -85,9 +86,20 @@ export async function findWyzieTVSubtitleCandidates(id, season, episode, limit =
   const data = await res.json();
   if (!Array.isArray(data)) throw new Error("Wyzie returned an unexpected payload");
 
+  // Anime episodes in particular are often only available in .ass/.ssa on
+  // OpenSubtitles (no .srt release at all) — accept those too and convert
+  // them to SRT at download time (see downloadWyzieSubtitleSRT) instead of
+  // silently dropping every candidate and falling through to the much
+  // weaker addic7ed/tvsubtitles.net scrapers.
   const seen = new Set();
   const candidates = data
-    .filter((s) => s && s.language === "en" && s.url && s.format === "srt")
+    .filter(
+      (s) =>
+        s &&
+        s.language === "en" &&
+        s.url &&
+        (s.format === "srt" || s.format === "ass" || s.format === "ssa")
+    )
     .sort((a, b) => (b.downloadCount || 0) - (a.downloadCount || 0))
     .map((s) => ({
       downloadUrl: s.url,
@@ -126,7 +138,8 @@ export async function downloadWyzieSubtitleSRT(downloadUrl) {
   if (!res.ok) throw new Error(`Subtitle download returned ${res.status}`);
 
   const buffer = Buffer.from(await res.arrayBuffer());
-  const srt = decodeSubtitleBuffer(buffer);
+  const decoded = decodeSubtitleBuffer(buffer);
+  const srt = isAssFormat(decoded) ? convertAssToSrt(decoded) : decoded;
 
   srtCache.set(downloadUrl, { timestamp: Date.now(), srt });
   return srt;
