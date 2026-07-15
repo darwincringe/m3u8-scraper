@@ -42,25 +42,32 @@ export const COMMON_LANGUAGES = Object.keys(LANGUAGE_NAMES);
 const cache = new Map();
 
 // The CDN mirrors vaplayer.ru hands out are short-lived and occasionally
-// dead on arrival, so we can't trust stream_urls[0] blindly — probe each
-// candidate and use the first one that actually responds.
-async function pickReachableStreamUrl(streamUrls, timeoutMs = 5000) {
-  for (const url of streamUrls) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const res = await fetch(url, {
-        headers: { Referer: "https://nextgencloudfabric.com/" },
-        signal: controller.signal,
-      });
-      if (res.ok) return url;
-    } catch {
-      // unreachable, try the next mirror
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-  return null;
+// dead on arrival, so we can't trust stream_urls[0] blindly — probe every
+// candidate in parallel and return every one that actually responds, in the
+// order vaplayer.ru returned them. The caller gets more than one mirror
+// because "reachable" here only means the manifest responded — some mirrors
+// still misbehave downstream (bad segments, mid-stream drops), so a player
+// that hits a dead-feeling stream can fall back to the next mirror instead
+// of the whole extraction failing.
+async function pickReachableStreamUrls(streamUrls, timeoutMs = 5000) {
+  const results = await Promise.all(
+    streamUrls.map(async (url) => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, {
+          headers: { Referer: "https://nextgencloudfabric.com/" },
+          signal: controller.signal,
+        });
+        return res.ok ? url : null;
+      } catch {
+        return null;
+      } finally {
+        clearTimeout(timeout);
+      }
+    })
+  );
+  return results.filter(Boolean);
 }
 
 // vidapi.cloud subtitle URLs end in a descriptive filename like
@@ -108,8 +115,8 @@ async function scrapeVaplayerAPI(type, tmdb_id, season, episode) {
       throw new Error("No stream URLs returned");
     }
 
-    const workingUrl = await pickReachableStreamUrl(streamUrls);
-    if (!workingUrl) {
+    const workingUrls = await pickReachableStreamUrls(streamUrls);
+    if (workingUrls.length === 0) {
       throw new Error("All stream mirrors are unreachable");
     }
 
@@ -121,7 +128,8 @@ async function scrapeVaplayerAPI(type, tmdb_id, season, episode) {
       : [];
 
     return {
-      hls_url: workingUrl,
+      hls_url: workingUrls[0],
+      mirrors: workingUrls,
       subtitles,
       imdb_id: json?.data?.imdb_id || null,
       title: json?.data?.title || null,
@@ -131,6 +139,7 @@ async function scrapeVaplayerAPI(type, tmdb_id, season, episode) {
     console.error(`Error: ${error.message}`);
     return {
       hls_url: null,
+      mirrors: [],
       subtitles: [],
       imdb_id: null,
       title: null,
@@ -264,6 +273,7 @@ app.get("/extract", async (req, res) => {
       success: false,
       error: "tmdb_id query param is required",
       hls_url: null,
+      mirrors: [],
       subtitles: [],
     });
   }
@@ -273,6 +283,7 @@ app.get("/extract", async (req, res) => {
       success: false,
       error: "season and episode query params are required for TV shows",
       hls_url: null,
+      mirrors: [],
       subtitles: [],
     });
   }
@@ -289,6 +300,12 @@ app.get("/extract", async (req, res) => {
     const proxiedHlsUrl = result.hls_url
       ? `${req.protocol}://${req.get("host")}/hls-proxy?url=${encodeURIComponent(result.hls_url)}`
       : null;
+    // Every reachable mirror, proxied the same way as hls_url — hls_url is
+    // always mirrors[0], kept as its own field for backward compatibility
+    // with existing consumers that only read hls_url.
+    const proxiedMirrors = (result.mirrors || []).map(
+      (url) => `${req.protocol}://${req.get("host")}/hls-proxy?url=${encodeURIComponent(url)}`
+    );
 
     let subtitles = result.subtitles;
     let subtitleLookupFailed = false;
@@ -355,6 +372,7 @@ app.get("/extract", async (req, res) => {
     const response = {
       success: !!result.hls_url,
       hls_url: proxiedHlsUrl,
+      mirrors: proxiedMirrors,
       subtitles,
       error: result.error,
     };
@@ -375,6 +393,7 @@ app.get("/extract", async (req, res) => {
       success: false,
       error: "Unexpected server error",
       hls_url: null,
+      mirrors: [],
       subtitles: [],
     });
   }
