@@ -85,6 +85,101 @@ function appendReleaseParam(url) {
   }
 }
 
+async function fetchVaplayerJSON(apiUrl) {
+  const res = await fetch(apiUrl, {
+    headers: {
+      Referer: "https://nextgencloudfabric.com/",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    },
+  });
+  if (!res.ok) throw new Error(`streamdata API returned ${res.status}`);
+  return res.json();
+}
+
+// streamdata.vaplayer.ru indexes a show's TV episodes by physical file
+// position in its own library folder, not by TMDB's episode_number. Seasons
+// with stray/duplicate files (common for The Office, whose double-length
+// episodes sometimes exist as both one combined file and two individual
+// ones) silently drift every later episode's index off of TMDB's numbering.
+// The upstream API still hands back the real episode title embedded in its
+// file_name though, so we cross-check that against TMDB and, on a
+// mismatch, search nearby indices for the one whose file actually matches
+// the requested episode.
+function normalizeTitleWords(str) {
+  return str
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .join(" ");
+}
+
+function fileNameMatchesTitle(fileName, title) {
+  if (!fileName || !title) return false;
+  const fileWords = normalizeTitleWords(fileName);
+  const titleWords = normalizeTitleWords(title);
+  if (!titleWords) return false;
+  return ` ${fileWords} `.includes(` ${titleWords} `);
+}
+
+async function getTMDBEpisodeTitle(tmdb_id, season, episode) {
+  if (!TMDB_API_KEY) return null;
+  try {
+    const url = `https://api.themoviedb.org/3/tv/${tmdb_id}/season/${season}/episode/${episode}?api_key=${TMDB_API_KEY}`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json?.name || null;
+  } catch {
+    return null;
+  }
+}
+
+const EPISODE_SEARCH_RADIUS = 8;
+
+// Resolve the upstream episode index that actually matches TMDB's episode
+// title for the requested season/episode. Falls back to the originally
+// requested episode if TMDB is unavailable or no matching index is found
+// nearby.
+async function resolveTVEpisodeIndex(tmdb_id, season, episode) {
+  const tmdbTitle = await getTMDBEpisodeTitle(tmdb_id, season, episode);
+  if (!tmdbTitle) return episode;
+
+  const vaplayerUrl = (candidate) =>
+    `https://streamdata.vaplayer.ru/api.php?tmdb=${tmdb_id}&type=tv&season=${season}&episode=${candidate}`;
+
+  try {
+    const json = await fetchVaplayerJSON(vaplayerUrl(episode));
+    if (fileNameMatchesTitle(json?.data?.file_name, tmdbTitle)) return episode;
+  } catch {
+    return episode;
+  }
+
+  console.warn(
+    `[episode-resolve] tmdb=${tmdb_id} S${season}E${episode} title mismatch, searching nearby indices for "${tmdbTitle}"`
+  );
+
+  for (let offset = 1; offset <= EPISODE_SEARCH_RADIUS; offset++) {
+    for (const candidate of [episode + offset, episode - offset]) {
+      if (candidate < 1) continue;
+      try {
+        const json = await fetchVaplayerJSON(vaplayerUrl(candidate));
+        if (fileNameMatchesTitle(json?.data?.file_name, tmdbTitle)) {
+          console.warn(`[episode-resolve] corrected to E${candidate}`);
+          return candidate;
+        }
+      } catch {
+        // ignore and keep searching
+      }
+    }
+  }
+
+  console.warn(`[episode-resolve] no matching index found, using requested E${episode}`);
+  return episode;
+}
+
 // vaplayer.ru exposes its stream data through a plain JSON API
 // (streamdata.vaplayer.ru). Its embed page's own JS aborts this same
 // request when it detects a CDP/debugger connection (i.e. any Playwright
@@ -98,17 +193,7 @@ async function scrapeVaplayerAPI(type, tmdb_id, season, episode) {
       : `https://streamdata.vaplayer.ru/api.php?tmdb=${tmdb_id}&type=movie`;
 
   try {
-    const res = await fetch(apiUrl, {
-      headers: {
-        Referer: "https://nextgencloudfabric.com/",
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-      },
-    });
-
-    if (!res.ok) throw new Error(`streamdata API returned ${res.status}`);
-
-    const json = await res.json();
+    const json = await fetchVaplayerJSON(apiUrl);
     const streamUrls = json?.data?.stream_urls;
 
     if (!Array.isArray(streamUrls) || streamUrls.length === 0) {
@@ -296,7 +381,9 @@ app.get("/extract", async (req, res) => {
   }
 
   try {
-    const result = await scrapeVaplayerAPI(type, tmdb_id, season, episode);
+    const resolvedEpisode =
+      type === "tv" ? await resolveTVEpisodeIndex(tmdb_id, season, episode) : episode;
+    const result = await scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode);
     const proxiedHlsUrl = result.hls_url
       ? `${req.protocol}://${req.get("host")}/hls-proxy?url=${encodeURIComponent(result.hls_url)}`
       : null;
