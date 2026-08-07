@@ -3,10 +3,11 @@ import { decodeSubtitleBuffer } from "./subtitleEncoding.js";
 import { extractReleaseTag } from "./releaseTag.js";
 import { isAssFormat, convertAssToSrt } from "./assToSrt.js";
 
-// Wyzie is a hosted subtitle API (sub.wyzie.io) keyed by TMDB/IMDb id. It's
-// series-friendly (takes season/episode) and returns ready-to-download SRT
-// URLs, so we use it as the primary TV subtitle source ahead of the
-// addic7ed/tvsubtitles.net scrapers.
+// Wyzie is a hosted subtitle API (sub.wyzie.io) keyed by TMDB/IMDb id. season
+// and episode are optional, so the same endpoint serves BOTH TV episodes and
+// movies. We append its diversified, language-capped results to whatever the
+// extractor already returned (see server.js) rather than using it only as a
+// fallback.
 const WYZIE_SEARCH_URL = "https://sub.wyzie.io/search";
 // Read lazily at call time, not module load: server.js runs dotenv.config()
 // after its imports, so process.env.WYZIE_API_KEY isn't populated yet when
@@ -20,12 +21,12 @@ const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 // The Wyzie account has a 1000-request/day cap on the *search* endpoint, so
-// we cache candidate lists aggressively. Subtitles for a given episode never
-// change, so a long TTL is safe: a popular episode is looked up from Wyzie
+// we cache candidate lists aggressively. Subtitles for a given title never
+// change, so a long TTL is safe: a popular title is looked up from Wyzie
 // once and then reused by every other viewer and on back-navigation/rewatch
 // for the rest of the day, keeping us well under the daily limit.
 const SEARCH_TTL_MS = 1000 * 60 * 60 * 24; // 24h
-const searchCache = new Map(); // `${id}:${season}:${episode}` -> { timestamp, candidates }
+const searchCache = new Map(); // `${id}:${season}:${episode}` | `${id}:movie` -> { timestamp, candidates }
 
 // Downloads hit opensubtitles.org (not counted against the Wyzie limit), but
 // caching the decoded SRT still avoids re-fetching the same file for every
@@ -35,7 +36,7 @@ const srtCache = new Map(); // downloadUrl -> { timestamp, srt }
 
 // Same idea as the addic7ed scraper's diversifyByRelease: prefer one
 // candidate per release/source (BluRay, WEB-DL, HDTV, ...) before filling
-// remaining slots by popularity, so the 10 we return aren't all the same
+// remaining slots by popularity, so the ones we return aren't all the same
 // release group.
 function diversifyByRelease(sortedCandidates, limit) {
   const found = [];
@@ -62,20 +63,21 @@ function diversifyByRelease(sortedCandidates, limit) {
 const ENGLISH_LIMIT = 5;
 const OTHER_LANGUAGE_LIMIT = 3;
 
-// Returns English + other-language subtitle candidates for a TV episode,
+// Shared core: search Wyzie for a TV episode (season + episode given) OR a
+// movie (both omitted), returning English + other-language candidates,
 // diversified by release and ranked by download count within each language,
 // shaped as [{ downloadUrl, release }, ...] (release prefixed with Wyzie's
-// `display` name, e.g. "ENGLISH.BLURAY") to match the addic7ed/movie
-// candidate consumers in server.js. English is always first, followed by
-// the other languages in alphabetical order (by display name). `id` is a
-// TMDB (or IMDb) id. Cached per episode.
-export async function findWyzieTVSubtitleCandidates(id, season, episode) {
-  if (!id || season == null || episode == null) return [];
+// `display` name, e.g. "ENGLISH.BLURAY") to match the addic7ed/movie candidate
+// consumers in server.js. English is always first, then the other languages in
+// alphabetical order. `id` is a TMDB (or IMDb) id. Cached per title.
+async function searchWyzieCandidates(id, season, episode) {
+  if (!id) return [];
 
   const apiKey = getApiKey();
   if (!apiKey) throw new Error("WYZIE_API_KEY is not set");
 
-  const cacheKey = `${id}:${season}:${episode}`;
+  const isEpisode = season != null && episode != null;
+  const cacheKey = isEpisode ? `${id}:${season}:${episode}` : `${id}:movie`;
   const cached = searchCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < SEARCH_TTL_MS) {
     return cached.candidates;
@@ -83,7 +85,9 @@ export async function findWyzieTVSubtitleCandidates(id, season, episode) {
 
   const url =
     `${WYZIE_SEARCH_URL}?id=${encodeURIComponent(id)}` +
-    `&season=${encodeURIComponent(season)}&episode=${encodeURIComponent(episode)}` +
+    (isEpisode
+      ? `&season=${encodeURIComponent(season)}&episode=${encodeURIComponent(episode)}`
+      : "") +
     `&key=${encodeURIComponent(apiKey)}`;
 
   const res = await fetch(url, {
@@ -97,8 +101,7 @@ export async function findWyzieTVSubtitleCandidates(id, season, episode) {
   // Anime episodes in particular are often only available in .ass/.ssa on
   // OpenSubtitles (no .srt release at all) — accept those too and convert
   // them to SRT at download time (see downloadWyzieSubtitleSRT) instead of
-  // silently dropping every candidate and falling through to the much
-  // weaker addic7ed/tvsubtitles.net scrapers.
+  // silently dropping every candidate.
   const seen = new Set();
   const usable = data
     .filter(
@@ -147,6 +150,17 @@ export async function findWyzieTVSubtitleCandidates(id, season, episode) {
   searchCache.set(cacheKey, { timestamp: Date.now(), candidates });
 
   return candidates;
+}
+
+// TV episodes: requires season + episode.
+export async function findWyzieTVSubtitleCandidates(id, season, episode) {
+  if (season == null || episode == null) return [];
+  return searchWyzieCandidates(id, season, episode);
+}
+
+// Movies: id only (no season/episode).
+export async function findWyzieMovieSubtitleCandidates(id) {
+  return searchWyzieCandidates(id);
 }
 
 // Downloads a Wyzie subtitle URL and returns decoded SRT text. Cached by URL.

@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express, { json } from "express";
 import cors from "cors";
 import fetch from "node-fetch";
@@ -14,8 +15,10 @@ import {
 } from "./utils/addic7edSubtitles.js";
 import {
   findWyzieTVSubtitleCandidates,
+  findWyzieMovieSubtitleCandidates,
   downloadWyzieSubtitleSRT,
 } from "./utils/wyzieSubtitles.js";
+import { registerSyncRoutes } from "./srctvSync.js";
 dotenv.config();
 
 const app = express();
@@ -31,6 +34,7 @@ export const headers = {
 
 app.use(cors());
 app.use(json());
+registerSyncRoutes(app);
 
 export const LANGUAGE_NAMES = {
   en: "English",
@@ -394,67 +398,68 @@ app.get("/extract", async (req, res) => {
       (url) => `${req.protocol}://${req.get("host")}/hls-proxy?url=${encodeURIComponent(url)}`
     );
 
-    let subtitles = result.subtitles;
-    let subtitleLookupFailed = false;
-    if (type === "movie" && subtitles.length === 0 && result.imdb_id) {
-      try {
-        const candidates = await findEnglishSubtitleZips(result.imdb_id, 10);
-        subtitles = candidates.map(
-          ({ zipUrl, release }) =>
-            `${req.protocol}://${req.get("host")}/movie-subtitle-srt?url=${encodeURIComponent(zipUrl)}&release=${encodeURIComponent(release)}`
-        );
-      } catch (err) {
-        console.error("[extract] YIFY subtitle fallback failed:", err.message);
-        subtitleLookupFailed = true;
-      }
-    } else if (type === "tv" && subtitles.length === 0) {
-      // Primary TV source: Wyzie (series-only). Keyed on tmdb_id (always
-      // present) and internally cached for 24h, so popular episodes are
-      // looked up from Wyzie's API at most once a day — keeping us under the
-      // account's 1000 requests/day cap even across many viewers and
-      // back-navigation.
-      try {
-        const wyzieCandidates = await findWyzieTVSubtitleCandidates(tmdb_id, season, episode);
-        // Served as the raw opensubtitles.org URL rather than proxied through
-        // our own /wyzie-subtitle-srt: this server's datacenter IP gets
-        // Cloudflare-blocked on that domain, but the viewer's own (residential)
-        // IP fetching it directly is not.
-        subtitles = wyzieCandidates.map(
-          ({ downloadUrl, release }) => `${downloadUrl}&release=${encodeURIComponent(release)}`
-        );
-      } catch (err) {
-        console.error("[extract] Wyzie subtitle lookup failed:", err.message);
-      }
+    // Subtitles: append Wyzie ON TOP of whatever the extractor returned ("the
+    // other subtitles") — Wyzie ALWAYS runs for both movies and TV (it's a
+    // fast, cached, multi-language API), so it is never gated behind a fallback.
+    const extractorSubs = Array.isArray(result.subtitles) ? result.subtitles : [];
+    const host = `${req.protocol}://${req.get("host")}`;
+    let subtitles = [...extractorSubs];
+    let errored = false;
 
-      // Fall back to the addic7ed scraper only if Wyzie found nothing.
-      let addic7edFailed = false;
-      if (subtitles.length === 0 && result.title) {
+    try {
+      const wcands =
+        type === "movie"
+          ? await findWyzieMovieSubtitleCandidates(tmdb_id)
+          : type === "tv"
+          ? await findWyzieTVSubtitleCandidates(tmdb_id, season, episode)
+          : [];
+      subtitles = subtitles.concat(
+        wcands.map(({ downloadUrl, release }) => `${downloadUrl}&release=${encodeURIComponent(release)}`)
+      );
+    } catch (err) {
+      console.error("[extract] Wyzie subtitle lookup failed:", err.message);
+      errored = true;
+    }
+
+    // The heavy scrapers (YIFY zip-validation for movies, addic7ed for TV) take
+    // ~10s, so they stay a FALLBACK — only run when we STILL have nothing —
+    // otherwise every playback start that already has Wyzie/extractor subtitles
+    // would eat that delay.
+    if (subtitles.length === 0) {
+      if (type === "movie" && result.imdb_id) {
+        try {
+          const candidates = await findEnglishSubtitleZips(result.imdb_id, 10);
+          subtitles = candidates.map(
+            ({ zipUrl, release }) =>
+              `${host}/movie-subtitle-srt?url=${encodeURIComponent(zipUrl)}&release=${encodeURIComponent(release)}`
+          );
+        } catch (err) {
+          console.error("[extract] YIFY subtitle fallback failed:", err.message);
+          errored = true;
+        }
+      } else if (type === "tv" && result.title) {
+        let addic7edFailed = false;
         try {
           const candidates = await findTVSubtitleCandidates(result.title, season, episode, 10);
           subtitles = candidates.map(
             ({ downloadUrl, release }) =>
-              `${req.protocol}://${req.get("host")}/tv-subtitle-srt?url=${encodeURIComponent(downloadUrl)}&release=${encodeURIComponent(release)}`
+              `${host}/tv-subtitle-srt?url=${encodeURIComponent(downloadUrl)}&release=${encodeURIComponent(release)}`
           );
         } catch (err) {
           console.error("[extract] addic7ed subtitle fallback failed:", err.message);
           addic7edFailed = true;
+          errored = true;
+        }
+        if (subtitles.length === 0 && addic7edFailed) {
+          subtitles = [
+            `${host}/tv-subtitle-srt-fallback?title=${encodeURIComponent(result.title)}&season=${season}&episode=${episode}`,
+          ];
         }
       }
-
-      // addic7ed is a single third-party site and occasionally rate-limits
-      // us outright (503s on every search, even unrelated ones) — fall back
-      // to the tvsubtitles.net scraper so a single site being down doesn't
-      // mean zero subtitles. That chain takes 30-90s (deliberate anti-bot
-      // delays plus a slow site), far too long to resolve inline here, so
-      // this is a lazy, unverified URL — resolved only when actually
-      // requested, same tradeoff the original tvsubtitles.net-only design
-      // accepted.
-      if (subtitles.length === 0 && addic7edFailed) {
-        subtitles = [
-          `${req.protocol}://${req.get("host")}/tv-subtitle-srt-fallback?title=${encodeURIComponent(result.title)}&season=${season}&episode=${episode}`,
-        ];
-      }
     }
+
+    // Don't cache a transient lookup failure that left us with nothing.
+    const subtitleLookupFailed = subtitles.length === 0 && errored;
 
     const response = {
       success: !!result.hls_url,
@@ -763,9 +768,7 @@ app.get("/subtitle-proxy", async (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.send(
-    "🎬 VidSrc Scraper API is running. Visit /subtitles or /extract to use."
-  );
+  res.redirect("/login");
 });
 
 app.listen(PORT, () => {

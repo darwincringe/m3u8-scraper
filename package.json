@@ -12,13 +12,17 @@
   "dependencies": {
     "addic7ed-api": "^2.0.1",
     "adm-zip": "^0.5.16",
+    "bcryptjs": "^3.0.3",
     "cheerio": "^1.1.0",
     "cors": "^2.8.5",
     "dotenv": "^17.0.1",
     "express": "^5.1.0",
+    "express-rate-limit": "^8.6.2",
     "FormData": "^0.10.1",
     "franc": "^6.2.0",
+    "jsonwebtoken": "^9.0.3",
     "mime": "^2.6.0",
+    "mongodb": "^7.5.0",
     "node-fetch": "^3.3.2",
     "puppeteer": "^24.10.0",
     "srt-to-vtt": "^1.1.3"
