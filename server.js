@@ -22,6 +22,10 @@ import { registerSyncRoutes } from "./srctvSync.js";
 dotenv.config();
 
 const app = express();
+// Behind nginx: trust the first proxy so req.ip is the real client IP
+// (correct per-user rate limiting) and req.protocol is https, so proxy
+// URLs are built as https (no mixed-content stalls on the web player).
+app.set("trust proxy", 1);
 const PORT = process.env.PORT || 4000;
 export const OPENSUB_API_KEY = process.env.OPENSUB_API_KEY;
 export const TMDB_API_KEY = process.env.TMDB_API_KEY;
