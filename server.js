@@ -771,6 +771,26 @@ app.get("/", (req, res) => {
   res.redirect("/login");
 });
 
+// Proxy for introdb.app skip-segments (recap/intro/outro). introdb only sends
+// CORS for its own origin, so the web app can't call it directly — it calls
+// this instead (our open CORS). Native still hits introdb directly.
+app.get("/segments", async (req, res) => {
+  const { imdb_id, season, episode } = req.query;
+  if (!imdb_id) return res.status(400).json({ error: "imdb_id required" });
+  try {
+    const u = new URL("https://api.introdb.app/segments");
+    u.searchParams.set("imdb_id", imdb_id);
+    if (season != null) u.searchParams.set("season", String(season));
+    if (episode != null) u.searchParams.set("episode", String(episode));
+    const r = await fetch(u.toString(), { headers: { Accept: "application/json" } });
+    const body = await r.text();
+    res.status(r.status).type("application/json").send(body);
+  } catch (e) {
+    console.error("[segments] introdb proxy failed:", e.message);
+    res.status(502).json({ error: "introdb fetch failed" });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
 });
