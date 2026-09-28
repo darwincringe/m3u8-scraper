@@ -19,6 +19,8 @@ import {
   downloadWyzieSubtitleSRT,
 } from "./utils/wyzieSubtitles.js";
 import { registerSyncRoutes } from "./srctvSync.js";
+import { fetchCatflixStream } from "./utils/catflix.js";
+import { Readable } from "stream";
 dotenv.config();
 
 const app = express();
@@ -49,25 +51,87 @@ export const COMMON_LANGUAGES = Object.keys(LANGUAGE_NAMES);
 // Simple in-memory cache to avoid re-fetching same query repeatedly (15 minutes)
 const cache = new Map();
 
-// The CDN mirrors vaplayer.ru hands out are short-lived and occasionally
-// dead on arrival, so we can't trust stream_urls[0] blindly — probe every
-// candidate in parallel and return every one that actually responds, in the
-// order vaplayer.ru returned them. The caller gets more than one mirror
-// because "reachable" here only means the manifest responded — some mirrors
-// still misbehave downstream (bad segments, mid-stream drops), so a player
-// that hits a dead-feeling stream can fall back to the next mirror instead
-// of the whole extraction failing.
-async function pickReachableStreamUrls(streamUrls, timeoutMs = 5000) {
+// Each upstream CDN wants to see the Referer of the player it was minted
+// for. vaplayer.ru mirrors check for nextgencloudfabric.com; the Catflix
+// chain (pwcloud.animanga.fun manifests, segments disguised as PNGs on
+// tiktokcdn.com) is what vidnest's own proxy sends.
+const BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const UPSTREAM_HEADER_RULES = [
+  {
+    test: /(^|\.)(animanga\.fun|tiktokcdn\.com|streamcasthub\.store)$/i,
+    headers: {
+      Referer: "https://pwcloud.animanga.fun/",
+      "User-Agent": BROWSER_UA,
+      Accept: "application/vnd.apple.mpegurl,application/x-mpegURL,*/*",
+    },
+  },
+];
+const DEFAULT_UPSTREAM_HEADERS = { Referer: "https://nextgencloudfabric.com/" };
+
+function upstreamHeadersFor(url) {
+  try {
+    const host = new URL(url).hostname;
+    const rule = UPSTREAM_HEADER_RULES.find((r) => r.test.test(host));
+    if (rule) return rule.headers;
+  } catch {}
+  return DEFAULT_UPSTREAM_HEADERS;
+}
+
+// Largest RESOLUTION advertised by a master playlist, as {width, height,
+// pixels} — all 0 when the text is a bare media playlist or advertises no
+// resolutions. Ranking uses pixel count rather than height so a 1920x800
+// scope-ratio film isn't out-ranked by a 1280x720 one.
+function bestResolutionInMaster(text) {
+  let best = { width: 0, height: 0, pixels: 0 };
+  for (const m of text.matchAll(/RESOLUTION=(\d+)x(\d+)/gi)) {
+    const width = parseInt(m[1], 10);
+    const height = parseInt(m[2], 10);
+    if (width * height > best.pixels) best = { width, height, pixels: width * height };
+  }
+  return best;
+}
+
+// Human label for a rendition, snapped to the standard tier it belongs to
+// (a 1920x800 letterboxed encode is still "1080p" to a viewer).
+const QUALITY_TIERS = [
+  [3840, 2160],
+  [2560, 1440],
+  [1920, 1080],
+  [1280, 720],
+  [854, 480],
+  [640, 360],
+];
+function qualityLabel({ width, height }) {
+  if (!width && !height) return null;
+  for (const [w, h] of QUALITY_TIERS) {
+    if (width >= w * 0.95 || height >= h * 0.95) return `${h}p`;
+  }
+  return `${height}p`;
+}
+
+// The CDN mirrors upstream sources hand out are short-lived and
+// occasionally dead on arrival, so we can't trust any URL blindly — probe
+// every candidate in parallel and keep every one whose manifest actually
+// responds, preserving input order. While the manifest is in hand, record
+// the best rendition it advertises so /extract can rank sources by quality.
+// "Reachable" here only means the manifest responded — some mirrors still
+// misbehave downstream (bad segments, mid-stream drops), so callers get all
+// of them and a player can fall back to the next mirror.
+async function probeStreamUrls(streamUrls, timeoutMs = 5000) {
   const results = await Promise.all(
     streamUrls.map(async (url) => {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
       try {
         const res = await fetch(url, {
-          headers: { Referer: "https://nextgencloudfabric.com/" },
+          headers: upstreamHeadersFor(url),
           signal: controller.signal,
         });
-        return res.ok ? url : null;
+        if (!res.ok) return null;
+        const text = await res.text();
+        if (!text.trimStart().startsWith("#EXTM3U")) return null;
+        return { url, ...bestResolutionInMaster(text) };
       } catch {
         return null;
       } finally {
@@ -208,8 +272,8 @@ async function scrapeVaplayerAPI(type, tmdb_id, season, episode) {
       throw new Error("No stream URLs returned");
     }
 
-    const workingUrls = await pickReachableStreamUrls(streamUrls);
-    if (workingUrls.length === 0) {
+    const streams = await probeStreamUrls(streamUrls);
+    if (streams.length === 0) {
       throw new Error("All stream mirrors are unreachable");
     }
 
@@ -221,8 +285,7 @@ async function scrapeVaplayerAPI(type, tmdb_id, season, episode) {
       : [];
 
     return {
-      hls_url: workingUrls[0],
-      mirrors: workingUrls,
+      streams: streams.map((s) => ({ ...s, source: "vaplayer" })),
       subtitles,
       imdb_id: json?.data?.imdb_id || null,
       title: json?.data?.title || null,
@@ -231,14 +294,41 @@ async function scrapeVaplayerAPI(type, tmdb_id, season, episode) {
   } catch (error) {
     console.error(`Error: ${error.message}`);
     return {
-      hls_url: null,
-      mirrors: [],
+      streams: [],
       subtitles: [],
       imdb_id: null,
       title: null,
       error: error.message,
     };
   }
+}
+
+// Catflix (via vidnest.fun's API) is the source hurawatch-style embeds get
+// their 1080p from: vaplayer.ru often only transcodes 360p/720p renditions
+// even when its file_name says 1080p. Returns probed streams (possibly
+// empty) — never throws, so a flaky secondary source can't break /extract.
+async function scrapeCatflix(type, tmdb_id, season, episode) {
+  try {
+    const stream = await fetchCatflixStream(type, tmdb_id, season, episode);
+    if (!stream) return [];
+    const streams = await probeStreamUrls([stream.url]);
+    return streams.map((s) => ({ ...s, source: "catflix" }));
+  } catch (error) {
+    console.error(`[catflix] ${error.message}`);
+    return [];
+  }
+}
+
+// Merge every reachable stream from all sources, best advertised rendition
+// first. The sort is stable and vaplayer streams come first in the input, so
+// on equal quality the long-standing source keeps priority (its mirrors are
+// known-good and its CDN is the one this proxy has been tuned against).
+function rankStreams(...streamLists) {
+  return streamLists
+    .flat()
+    .map((s, index) => ({ ...s, index }))
+    .sort((a, b) => b.pixels - a.pixels || a.index - b.index)
+    .map(({ index, ...s }) => s);
 }
 
 // Some CDN mirrors (e.g. startupscalingsystem.website) intermittently drop
@@ -249,7 +339,7 @@ async function fetchUpstreamWithRetry(target, attempts = 3) {
   for (let i = 0; i < attempts; i++) {
     try {
       const upstream = await fetch(target, {
-        headers: { Referer: "https://nextgencloudfabric.com/" },
+        headers: upstreamHeadersFor(target),
       });
       if (upstream.ok) return upstream;
       lastError = new Error(`Upstream fetch failed with status ${upstream.status}`);
@@ -261,93 +351,158 @@ async function fetchUpstreamWithRetry(target, attempts = 3) {
   throw lastError;
 }
 
-// vaplayer.ru's CDN mislabels media segments as Content-Type: text/html
-// (anti-hotlink obfuscation) and sends a spec-invalid CORS header combo
-// (Allow-Credentials: true + Allow-Origin: *) on them, which browsers
-// reject whenever a player sends credentials. This proxy re-serves the
-// manifest chain and segments from our own origin with correct headers
-// so any player can consume them.
+const TS_PACKET_SIZE = 188;
+const TS_SYNC_BYTE = 0x47;
+
+// Offset of the first MPEG-TS packet in buf: the first byte that is a sync
+// byte and is followed by sync bytes at each 188-byte stride (as many strides
+// as the buffer can show). Returns -1 when no TS packet structure is found,
+// e.g. for fMP4 segments, which must be passed through untouched.
+function findTsSyncOffset(buf) {
+  const limit = Math.min(buf.length, 64 * 1024);
+  for (let i = 0; i < limit; i++) {
+    if (buf[i] !== TS_SYNC_BYTE) continue;
+    let ok = true;
+    for (let k = 1; k <= 3 && i + k * TS_PACKET_SIZE < buf.length; k++) {
+      if (buf[i + k * TS_PACKET_SIZE] !== TS_SYNC_BYTE) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return i;
+  }
+  return -1;
+}
+
+// Pull at least minBytes off the front of a Readable so we can sniff the
+// payload before deciding how to serve it, and hand back an iterator that
+// continues from where we stopped.
+async function peekStream(body, minBytes) {
+  const iterator = body[Symbol.asyncIterator]();
+  const chunks = [];
+  let length = 0;
+  let done = false;
+  while (length < minBytes) {
+    const next = await iterator.next();
+    if (next.done) {
+      done = true;
+      break;
+    }
+    chunks.push(next.value);
+    length += next.value.length;
+  }
+  return { head: Buffer.concat(chunks), iterator, done };
+}
+
+async function* resumeStream(head, iterator, done) {
+  try {
+    if (head.length) yield head;
+    if (done) return;
+    for (;;) {
+      const next = await iterator.next();
+      if (next.done) return;
+      yield next.value;
+    }
+  } finally {
+    // Reached on early termination too (client went away), releasing the
+    // upstream socket instead of letting it drain a multi-MB segment for
+    // nobody.
+    await iterator.return?.();
+  }
+}
+
+// Upstream CDNs mislabel what they serve (anti-hotlink obfuscation):
+// vaplayer.ru's mirrors tag media segments as text/html and send a
+// spec-invalid CORS header combo (Allow-Credentials: true + Allow-Origin: *)
+// that browsers reject whenever a player sends credentials; the Catflix
+// chain names master playlists "master.txt" and hosts each TS segment on
+// tiktokcdn.com as an "image" — a real 1x1 PNG stub with the MPEG-TS bytes
+// appended after IEND. hls.js happens to scan past that stub, but native
+// players (iOS, ExoPlayer) do not. This proxy sniffs the payload rather than
+// trusting names or Content-Type, strips the stub, and re-serves the manifest
+// chain and segments from our own origin with correct headers.
 app.get("/hls-proxy", async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).send("Missing url param");
 
   try {
     const upstream = await fetchUpstreamWithRetry(target);
+    const { head, iterator, done } = await peekStream(upstream.body, 4096);
 
-    // Playlists (.m3u8) are small and must be buffered so their segment URLs
-    // can be rewritten to point back at this proxy. The CDN mislabels
-    // Content-Type, so detect by path extension (playlists here are always
-    // named *.m3u8; every other resource is a media segment).
-    let isPlaylist = false;
-    try {
-      isPlaylist = new URL(target).pathname.toLowerCase().endsWith(".m3u8");
-    } catch {}
+    const isPlaylist = head.toString("utf8", 0, 16).trimStart().startsWith("#EXTM3U");
 
+    // Playlists are small and must be buffered so their segment URLs can be
+    // rewritten to point back at this proxy.
     if (isPlaylist) {
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      const text = buf.toString("utf8");
-      if (text.startsWith("#EXTM3U")) {
-        const baseUrl = new URL(target);
-        const isMaster = text.includes("#EXT-X-STREAM-INF");
-        const isVariant = req.query.variant === "1";
+      const rest = [];
+      for await (const chunk of resumeStream(Buffer.alloc(0), iterator, done)) rest.push(chunk);
+      const text = Buffer.concat([head, ...rest]).toString("utf8");
+      const baseUrl = new URL(target);
+      const isMaster = text.includes("#EXT-X-STREAM-INF");
+      const isVariant = req.query.variant === "1";
 
-        // Most titles hand back a master playlist (multi-quality, with
-        // #EXT-X-STREAM-INF), but some — e.g. brand-new single-quality
-        // releases — return a bare *media* playlist directly. Several players
-        // only initialise their pipeline from a master and just show a black
-        // screen (no error) for a raw media playlist. So when we get a bare
-        // media playlist at the top level (no &variant flag yet), wrap it in a
-        // minimal synthetic master pointing back at itself with &variant=1, so
-        // every stream we serve has the same master -> media -> segment shape.
-        if (!isMaster && !isVariant) {
-          const selfUrl = `/hls-proxy?url=${encodeURIComponent(target)}&variant=1`;
-          const master = [
-            "#EXTM3U",
-            "#EXT-X-INDEPENDENT-SEGMENTS",
-            "#EXT-X-STREAM-INF:BANDWIDTH=3000000",
-            selfUrl,
-          ].join("\n");
-          res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-          return res.send(master);
-        }
-
-        // Rewrite child URLs back through this proxy. Variant playlists inside
-        // a master keep the &variant flag so the follow-up request is served
-        // as media (and not wrapped again); segment URLs in a media playlist
-        // need no flag.
-        const childSuffix = isMaster ? "&variant=1" : "";
-        const rewritten = text
-          .split("\n")
-          .map((line) => {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed.startsWith("#")) return line;
-            const absoluteUrl = new URL(trimmed, baseUrl).toString();
-            return `/hls-proxy?url=${encodeURIComponent(absoluteUrl)}${childSuffix}`;
-          })
-          .join("\n");
-
+      // Most titles hand back a master playlist (multi-quality, with
+      // #EXT-X-STREAM-INF), but some — e.g. brand-new single-quality
+      // releases — return a bare *media* playlist directly. Several players
+      // only initialise their pipeline from a master and just show a black
+      // screen (no error) for a raw media playlist. So when we get a bare
+      // media playlist at the top level (no &variant flag yet), wrap it in a
+      // minimal synthetic master pointing back at itself with &variant=1, so
+      // every stream we serve has the same master -> media -> segment shape.
+      if (!isMaster && !isVariant) {
+        const selfUrl = `/hls-proxy?url=${encodeURIComponent(target)}&variant=1`;
+        const master = [
+          "#EXTM3U",
+          "#EXT-X-INDEPENDENT-SEGMENTS",
+          "#EXT-X-STREAM-INF:BANDWIDTH=3000000",
+          selfUrl,
+        ].join("\n");
         res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-        return res.send(rewritten);
+        return res.send(master);
       }
-      // Extension said .m3u8 but the body isn't a playlist — serve as-is.
-      res.setHeader("Content-Type", "video/mp2t");
-      return res.send(buf);
+
+      // Rewrite child URLs back through this proxy. Variant playlists inside
+      // a master keep the &variant flag so the follow-up request is served
+      // as media (and not wrapped again); segment URLs in a media playlist
+      // need no flag.
+      const childSuffix = isMaster ? "&variant=1" : "";
+      const rewritten = text
+        .split("\n")
+        .map((line) => {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith("#")) return line;
+          const absoluteUrl = new URL(trimmed, baseUrl).toString();
+          return `/hls-proxy?url=${encodeURIComponent(absoluteUrl)}${childSuffix}`;
+        })
+        .join("\n");
+
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      return res.send(rewritten);
     }
 
     // Media segment: force the correct MIME type regardless of what the
-    // upstream CDN claims, and STREAM it straight through. Buffering whole
-    // segments (some 6MB+ on slow mirrors) delayed the first byte to the
-    // player by several seconds, tripping native-player segment timeouts and
-    // showing a black screen for titles served by slower mirrors.
-    res.setHeader("Content-Type", "video/mp2t");
-    const contentLength = upstream.headers.get("content-length");
-    if (contentLength) res.setHeader("Content-Length", contentLength);
+    // upstream CDN claims, drop any wrapper bytes ahead of the first TS
+    // packet, and STREAM the rest straight through. Buffering whole segments
+    // (some 6MB+ on slow mirrors) delayed the first byte to the player by
+    // several seconds, tripping native-player segment timeouts and showing a
+    // black screen for titles served by slower mirrors.
+    const syncOffset = findTsSyncOffset(head);
+    const skip = syncOffset > 0 ? syncOffset : 0;
+    const segmentHead = skip ? head.subarray(skip) : head;
 
-    upstream.body.on("error", (err) => {
+    res.setHeader("Content-Type", "video/mp2t");
+    const contentLength = parseInt(upstream.headers.get("content-length") || "", 10);
+    if (Number.isFinite(contentLength) && contentLength >= skip) {
+      res.setHeader("Content-Length", String(contentLength - skip));
+    }
+
+    const body = Readable.from(resumeStream(segmentHead, iterator, done));
+    body.on("error", (err) => {
       console.error("[hls-proxy] Segment stream error:", err.message);
       res.destroy(err);
     });
-    upstream.body.pipe(res);
+    res.on("close", () => body.destroy());
+    body.pipe(res);
   } catch (err) {
     console.error("[hls-proxy] Error:", err.message);
     if (!res.headersSent) res.status(500).send("Proxy error");
@@ -389,18 +544,34 @@ app.get("/extract", async (req, res) => {
   }
 
   try {
-    const resolvedEpisode =
-      type === "tv" ? await resolveTVEpisodeIndex(tmdb_id, season, episode) : episode;
-    const result = await scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode);
-    const proxiedHlsUrl = result.hls_url
-      ? `${req.protocol}://${req.get("host")}/hls-proxy?url=${encodeURIComponent(result.hls_url)}`
-      : null;
-    // Every reachable mirror, proxied the same way as hls_url — hls_url is
-    // always mirrors[0], kept as its own field for backward compatibility
-    // with existing consumers that only read hls_url.
-    const proxiedMirrors = (result.mirrors || []).map(
-      (url) => `${req.protocol}://${req.get("host")}/hls-proxy?url=${encodeURIComponent(url)}`
-    );
+    // Both sources are independent, so resolve them concurrently. vaplayer
+    // also supplies title/imdb_id/subtitles used further down, so it always
+    // runs even when Catflix ends up winning on quality.
+    const [result, catflixStreams] = await Promise.all([
+      (async () => {
+        const resolvedEpisode =
+          type === "tv" ? await resolveTVEpisodeIndex(tmdb_id, season, episode) : episode;
+        return scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode);
+      })(),
+      scrapeCatflix(type, tmdb_id, season, episode),
+    ]);
+
+    const streams = rankStreams(result.streams, catflixStreams);
+    const best = streams[0] || null;
+    if (best) {
+      console.log(
+        `[extract] ${streams.length} stream(s): ` +
+          streams.map((s) => `${s.source}@${qualityLabel(s) || "?"}`).join(", ")
+      );
+    }
+
+    const proxied = (url) =>
+      `${req.protocol}://${req.get("host")}/hls-proxy?url=${encodeURIComponent(url)}`;
+    const proxiedHlsUrl = best ? proxied(best.url) : null;
+    // Every reachable stream from every source, proxied the same way as
+    // hls_url — hls_url is always mirrors[0], kept as its own field for
+    // backward compatibility with existing consumers that only read hls_url.
+    const proxiedMirrors = streams.map((s) => proxied(s.url));
 
     // Subtitles: append Wyzie ON TOP of whatever the extractor returned ("the
     // other subtitles") — Wyzie ALWAYS runs for both movies and TV (it's a
@@ -466,11 +637,13 @@ app.get("/extract", async (req, res) => {
     const subtitleLookupFailed = subtitles.length === 0 && errored;
 
     const response = {
-      success: !!result.hls_url,
+      success: !!best,
       hls_url: proxiedHlsUrl,
       mirrors: proxiedMirrors,
+      source: best ? best.source : null,
+      quality: best ? qualityLabel(best) : null,
       subtitles,
-      error: result.error,
+      error: best ? null : result.error || "No stream found",
     };
 
     // Don't cache a transient subtitle-lookup failure as if it were a
