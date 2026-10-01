@@ -19,7 +19,7 @@ import {
   downloadWyzieSubtitleSRT,
 } from "./utils/wyzieSubtitles.js";
 import { registerSyncRoutes } from "./srctvSync.js";
-import { fetchCatflixStream } from "./utils/catflix.js";
+import { fetchCatflixStream, fetchSuperstreamStreams } from "./utils/catflix.js";
 import { Readable } from "stream";
 import http from "http";
 import https from "https";
@@ -81,6 +81,12 @@ const UPSTREAM_HEADER_RULES = [
       "User-Agent": BROWSER_UA,
       Accept: "application/vnd.apple.mpegurl,application/x-mpegURL,*/*",
     },
+  },
+  // Superstream's CDN (lookmovie2) doesn't check Referer; just look like a
+  // browser.
+  {
+    test: /(^|\.)laterascent\.site$/i,
+    headers: { "User-Agent": BROWSER_UA },
   },
 ];
 const DEFAULT_UPSTREAM_HEADERS = { Referer: "https://nextgencloudfabric.com/" };
@@ -496,15 +502,85 @@ async function scrapeCatflix(type, tmdb_id, season, episode) {
   }
 }
 
+// Superstream (also via vidnest.fun's API) hands out one bare media
+// playlist per quality instead of a master, so a player given a single
+// one of them would have no ABR. We probe each quality's playlist head,
+// keep the live ones, and publish the lot as ONE stream whose `renditions`
+// /extract turns into a synthetic master via /hls-master (see below).
+// Nominal RESOLUTION/BANDWIDTH per advertised quality label — measured
+// segment sizes put Superstream's 1080p at ~3.5 Mbps, 720p ~2.1, 480p ~1.2.
+const SUPERSTREAM_TIERS = {
+  2160: { width: 3840, height: 2160, bandwidth: 12_000_000 },
+  1440: { width: 2560, height: 1440, bandwidth: 7_000_000 },
+  1080: { width: 1920, height: 1080, bandwidth: 4_000_000 },
+  720: { width: 1280, height: 720, bandwidth: 2_200_000 },
+  480: { width: 854, height: 480, bandwidth: 1_200_000 },
+  360: { width: 640, height: 360, bandwidth: 800_000 },
+};
+async function scrapeSuperstream(type, tmdb_id, season, episode) {
+  try {
+    const list = await fetchSuperstreamStreams(type, tmdb_id, season, episode);
+    if (!list) return { streams: [], transient: false };
+    const probed = await Promise.all(
+      list.map(async (s) => {
+        const probe = await probePlaylist(s.url, PROBE_TIMEOUT_MS, PROBE_ATTEMPTS, { headOnly: true });
+        const tier = SUPERSTREAM_TIERS[s.height] || { width: 0, height: s.height, bandwidth: 1_500_000 };
+        return { ...tier, url: s.url, status: probe.status };
+      })
+    );
+    // Require at least one playlist to have answered: if the whole CDN is
+    // timing out right now, don't rank it above a source that works.
+    const renditions = probed.filter((r) => r.status !== "dead");
+    if (!renditions.some((r) => r.status === "ok")) {
+      console.warn(`[superstream] no reachable rendition for ${type} ${tmdb_id}`);
+      return { streams: [], transient: true };
+    }
+    const best = renditions.reduce((a, b) => (b.width * b.height > a.width * a.height ? b : a));
+    return {
+      streams: [
+        {
+          url: best.url,
+          width: best.width,
+          height: best.height,
+          pixels: best.width * best.height,
+          source: "superstream",
+          renditions: renditions.map(({ url, width, height, bandwidth }) => ({ url, width, height, bandwidth })),
+        },
+      ],
+      transient: false,
+    };
+  } catch (error) {
+    console.error(`[superstream] ${error.message}`);
+    return { streams: [], transient: error.status !== 404 };
+  }
+}
+
+// Encode a rendition list into the /hls-master query param.
+const encodeRenditions = (renditions) =>
+  Buffer.from(JSON.stringify(renditions), "utf8").toString("base64url");
+function decodeRenditions(param) {
+  try {
+    const list = JSON.parse(Buffer.from(String(param), "base64url").toString("utf8"));
+    if (!Array.isArray(list)) return null;
+    const out = list.filter(
+      (r) => r && typeof r.url === "string" && /^https?:\/\//i.test(r.url)
+    );
+    return out.length ? out : null;
+  } catch {
+    return null;
+  }
+}
+
 // Merge every reachable stream from all sources. Catflix is always the
 // primary source when it has any working stream: its encodes are the ones
 // viewers judged better, and its 1080p sits at ~2.7 Mbps where vaplayer
 // advertises ~6.8 Mbps — a rate ABR often refuses through this proxy,
-// leaving the player parked on 720p. vaplayer is the fallback: it follows
-// in `mirrors` for every title, and becomes hls_url only when Catflix has
-// nothing (no entry, dead manifest, relay rate-limited). Within a source,
-// higher working tier first.
-const SOURCE_PRIORITY = { catflix: 0, vaplayer: 1 };
+// leaving the player parked on 720p. Superstream is next: real ~3.5 Mbps
+// 1080p where vaplayer's "1080p" is often a ~1 Mbps YTS re-encode. vaplayer
+// is the last fallback: it follows in `mirrors` for every title, and becomes
+// hls_url only when neither of the others has anything (no entry, dead
+// manifest, relay rate-limited). Within a source, higher working tier first.
+const SOURCE_PRIORITY = { catflix: 0, superstream: 1, vaplayer: 2 };
 function rankStreams(...streamLists) {
   return streamLists
     .flat()
@@ -602,6 +678,42 @@ async function* resumeStream(head, iterator, done) {
 // players (iOS, ExoPlayer) do not. This proxy sniffs the payload rather than
 // trusting names or Content-Type, strips the stub, and re-serves the manifest
 // chain and segments from our own origin with correct headers.
+// Synthetic master for sources that publish one bare media playlist per
+// quality (Superstream). `r` is the base64url JSON list of
+// {url, width, height, bandwidth} /extract produced; each entry becomes a
+// rendition served through /hls-proxy with &variant=1 so the media playlist
+// isn't wrapped again. Renditions whose playlist is known-dead right now
+// are dropped, the same way /hls-proxy prunes a real master.
+app.get("/hls-master", async (req, res) => {
+  const renditions = decodeRenditions(req.query.r);
+  if (!renditions) return res.status(400).send("Missing or invalid r param");
+
+  try {
+    const probed = await Promise.all(
+      renditions.map(async (r) => ({
+        ...r,
+        status: (await probePlaylist(r.url, 6000, 2, { headOnly: true })).status,
+      }))
+    );
+    let live = probed.filter((r) => r.status !== "dead");
+    if (!live.length) live = probed;
+    live.sort((a, b) => (a.bandwidth || 0) - (b.bandwidth || 0));
+
+    const lines = ["#EXTM3U", "#EXT-X-INDEPENDENT-SEGMENTS"];
+    for (const r of live) {
+      const attrs = [`BANDWIDTH=${Math.round(r.bandwidth || 1_500_000)}`];
+      if (r.width && r.height) attrs.push(`RESOLUTION=${r.width}x${r.height}`);
+      lines.push(`#EXT-X-STREAM-INF:${attrs.join(",")}`);
+      lines.push(`/hls-proxy?url=${encodeURIComponent(r.url)}&variant=1`);
+    }
+    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+    res.send(lines.join("\n"));
+  } catch (err) {
+    console.error("[hls-master]", err.message);
+    res.status(502).send("Proxy error");
+  }
+});
+
 app.get("/hls-proxy", async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).send("Missing url param");
@@ -754,19 +866,21 @@ app.get("/extract", async (req, res) => {
   }
 
   try {
-    // Both sources are independent, so resolve them concurrently. vaplayer
+    // All sources are independent, so resolve them concurrently. vaplayer
     // also supplies title/imdb_id/subtitles used further down, so it always
-    // runs even when Catflix ends up winning on quality.
-    const [result, catflix] = await Promise.all([
+    // runs even when another source ends up winning.
+    const [result, catflix, superstream] = await Promise.all([
       (async () => {
         const resolvedEpisode =
           type === "tv" ? await resolveTVEpisodeIndex(tmdb_id, season, episode) : episode;
         return scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode);
       })(),
       scrapeCatflix(type, tmdb_id, season, episode),
+      scrapeSuperstream(type, tmdb_id, season, episode),
     ]);
+    const secondaryTransient = catflix.transient || superstream.transient;
 
-    const streams = rankStreams(result.streams, catflix.streams);
+    const streams = rankStreams(result.streams, catflix.streams, superstream.streams);
     const best = streams[0] || null;
     if (best) {
       console.log(
@@ -775,13 +889,19 @@ app.get("/extract", async (req, res) => {
       );
     }
 
-    const proxied = (url) =>
-      `${req.protocol}://${req.get("host")}/hls-proxy?url=${encodeURIComponent(url)}`;
-    const proxiedHlsUrl = best ? proxied(best.url) : null;
+    // A stream that is a set of per-quality media playlists (Superstream)
+    // is served through /hls-master, which stitches them into one master so
+    // the player still gets ABR; everything else goes straight to /hls-proxy.
+    const origin = `${req.protocol}://${req.get("host")}`;
+    const proxied = (s) =>
+      s.renditions
+        ? `${origin}/hls-master?r=${encodeRenditions(s.renditions)}`
+        : `${origin}/hls-proxy?url=${encodeURIComponent(s.url)}`;
+    const proxiedHlsUrl = best ? proxied(best) : null;
     // Every reachable stream from every source, proxied the same way as
     // hls_url — hls_url is always mirrors[0], kept as its own field for
     // backward compatibility with existing consumers that only read hls_url.
-    const proxiedMirrors = streams.map((s) => proxied(s.url));
+    const proxiedMirrors = streams.map(proxied);
 
     // Subtitles: append Wyzie ON TOP of whatever the extractor returned ("the
     // other subtitles") — Wyzie ALWAYS runs for both movies and TV (it's a
@@ -859,13 +979,13 @@ app.get("/extract", async (req, res) => {
     // Don't cache a transient subtitle-lookup failure as if it were a
     // final answer — that would keep serving "no subtitles" for the rest
     // of the 15-minute window even though a retry would likely succeed.
-    // Likewise, when Catflix flaked (its CDN stalls at random) we did get a
-    // playable answer, but possibly a lower quality than exists — cache it
-    // only briefly so the next viewer re-tries for the 1080p.
+    // Likewise, when Catflix/Superstream flaked (their CDNs stall at random)
+    // we did get a playable answer, but possibly a lower quality than exists
+    // — cache it only briefly so the next viewer re-tries for the 1080p.
     if (response.success && !subtitleLookupFailed) {
       cache.set(cacheKey, {
         timestamp: Date.now(),
-        ttl: catflix.transient ? CACHE_TTL_TRANSIENT_MS : CACHE_TTL_MS,
+        ttl: secondaryTransient ? CACHE_TTL_TRANSIENT_MS : CACHE_TTL_MS,
         response,
       });
     }

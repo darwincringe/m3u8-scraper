@@ -1,12 +1,19 @@
-// "Catflix" stream source, as used by the vidnest.fun embed (one of the
-// six players hurawatch.cz iframes). It consistently exposes a 1920x1080
-// rendition where vaplayer.ru tops out at 720p for the same file.
+// Stream sources behind the vidnest.fun embed (one of the six players
+// hurawatch.cz iframes). vidnest's frontend offers a dozen backends, all
+// served from https://new.vidnest.fun/<backend>/{movie|tv}/... and all
+// answering {"data": "<blob>", "encrypted": true}. The "encryption" is just
+// base64 with a shuffled alphabet, reproduced here from their bundle. We use
+// two of them:
 //
-// vidnest's frontend calls https://new.vidnest.fun/yflix/{movie|tv}/... and
-// gets back {"data": "<blob>", "encrypted": true}. The "encryption" is just
-// base64 with a shuffled alphabet, reproduced here from their bundle. The
-// decoded JSON is {url, headers} where url is an HLS master playlist (usually
-// proxied through pwcloud.animanga.fun/hls/<base64 upstream>/master.m3u8).
+// - "Catflix" (/yflix): consistently exposes a 1920x1080 rendition where
+//   vaplayer.ru tops out at 720p for the same file. Decoded JSON is
+//   {url, headers}; url is an HLS master (usually proxied through
+//   pwcloud.animanga.fun/hls/<base64 upstream>/master.m3u8).
+// - "Superstream" (/superstream, backed by lookmovie2): decoded JSON is
+//   {streams: [{quality: "1080p", url, type: "hls"}], subtitles: [...]}
+//   where each url is a bare *media* playlist on *.laterascent.site. Its
+//   1080p runs ~3.5 Mbps where vaplayer's "1080p" YTS re-encodes sit around
+//   1 Mbps, so it's the better fallback when Catflix has no entry.
 import fetch from "node-fetch";
 
 const API_BASE = "https://new.vidnest.fun";
@@ -45,7 +52,7 @@ async function fetchJSON(url, timeoutMs) {
   try {
     const res = await fetch(url, { headers: REQUEST_HEADERS, signal: controller.signal });
     if (!res.ok) {
-      const err = new Error(`catflix API returned ${res.status}`);
+      const err = new Error(`vidnest API returned ${res.status}`);
       err.status = res.status;
       throw err;
     }
@@ -66,22 +73,52 @@ setInterval(() => {
   for (const [k, v] of lookupCache) if (now - v.at >= LOOKUP_TTL_MS) lookupCache.delete(k);
 }, 60 * 1000).unref();
 
-// Returns { url, headers } or null when the source has nothing for this
-// title. Network/parse errors are thrown so the caller can log them.
-export async function fetchCatflixStream(type, tmdb_id, season, episode, timeoutMs = 8000) {
-  const path =
-    type === "tv"
-      ? `/yflix/tv/${tmdb_id}/${season}/${episode}`
-      : `/yflix/movie/${tmdb_id}`;
+function titlePath(backend, type, tmdb_id, season, episode) {
+  return type === "tv"
+    ? `/${backend}/tv/${tmdb_id}/${season}/${episode}`
+    : `/${backend}/movie/${tmdb_id}`;
+}
 
+// Decoded payload for one backend/title, memoised. Network/parse errors
+// are thrown so the caller can log them.
+async function fetchVidnestPayload(path, timeoutMs) {
   const cached = lookupCache.get(path);
   if (cached && Date.now() - cached.at < LOOKUP_TTL_MS) return cached.value;
-  const value = await lookupCatflixStream(path, timeoutMs);
+  const value = await lookupVidnestPayload(path, timeoutMs);
   lookupCache.set(path, { at: Date.now(), value });
   return value;
 }
 
-async function lookupCatflixStream(path, timeoutMs) {
+// Catflix: returns { url, headers } or null when the source has nothing
+// for this title.
+export async function fetchCatflixStream(type, tmdb_id, season, episode, timeoutMs = 8000) {
+  const payload = await fetchVidnestPayload(titlePath("yflix", type, tmdb_id, season, episode), timeoutMs);
+  const url = typeof payload?.url === "string" ? payload.url.trim() : "";
+  if (!/^https?:\/\//i.test(url)) return null;
+  return { url, headers: payload.headers || {} };
+}
+
+// Superstream: returns [{ url, quality, height }] (one media playlist per
+// quality, best first) or null when the source has nothing for this title.
+export async function fetchSuperstreamStreams(type, tmdb_id, season, episode, timeoutMs = 8000) {
+  const payload = await fetchVidnestPayload(
+    titlePath("superstream", type, tmdb_id, season, episode),
+    timeoutMs
+  );
+  const list = Array.isArray(payload?.streams) ? payload.streams : [];
+  const streams = list
+    .filter((s) => typeof s?.url === "string" && /^https?:\/\//i.test(s.url.trim()))
+    .filter((s) => !s.type || /hls|m3u8/i.test(s.type))
+    .map((s) => ({
+      url: s.url.trim(),
+      quality: String(s.quality || "").trim(),
+      height: parseInt(/(\d{3,4})p/i.exec(s.quality || "")?.[1] || "0", 10),
+    }))
+    .sort((a, b) => b.height - a.height);
+  return streams.length ? streams : null;
+}
+
+async function lookupVidnestPayload(path, timeoutMs) {
   const apiUrl = `${API_BASE}${path}`;
   let json;
   try {
@@ -100,7 +137,7 @@ async function lookupCatflixStream(path, timeoutMs) {
 
   let payload = json;
   if (json?.encrypted) {
-    if (typeof json.data !== "string") throw new Error("catflix response missing data");
+    if (typeof json.data !== "string") throw new Error("vidnest response missing data");
     const decoded = decodeVidnestCipher(json.data);
     try {
       payload = JSON.parse(decoded);
@@ -113,14 +150,12 @@ async function lookupCatflixStream(path, timeoutMs) {
   // {"error":"IP blocked for excessive rate limiting. Try again in 7m49s."}
   // (it rate-limits per source IP, and the relay's egress IP is shared).
   // Surface those as throws so the caller treats them as transient rather
-  // than "this title has no Catflix stream".
+  // than "this title has no stream here".
   if (payload && typeof payload === "object" && payload.error) {
-    const err = new Error(`catflix API error: ${payload.error}`);
+    const err = new Error(`vidnest API error: ${payload.error}`);
     err.status = /rate limit/i.test(payload.error) ? 429 : 502;
     throw err;
   }
 
-  const url = typeof payload?.url === "string" ? payload.url.trim() : "";
-  if (!/^https?:\/\//i.test(url)) return null;
-  return { url, headers: payload.headers || {} };
+  return payload;
 }
