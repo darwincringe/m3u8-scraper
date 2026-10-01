@@ -55,6 +55,17 @@ async function fetchJSON(url, timeoutMs) {
   }
 }
 
+// Successful lookups (including "nothing for this title") are remembered
+// for a while: the manifest URLs the API hands out are stable, and the API
+// rate-limits per source IP — through the relay that IP is shared with
+// every other user of the Worker, so every call we can skip matters.
+const LOOKUP_TTL_MS = 30 * 60 * 1000;
+const lookupCache = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of lookupCache) if (now - v.at >= LOOKUP_TTL_MS) lookupCache.delete(k);
+}, 60 * 1000).unref();
+
 // Returns { url, headers } or null when the source has nothing for this
 // title. Network/parse errors are thrown so the caller can log them.
 export async function fetchCatflixStream(type, tmdb_id, season, episode, timeoutMs = 8000) {
@@ -63,6 +74,14 @@ export async function fetchCatflixStream(type, tmdb_id, season, episode, timeout
       ? `/yflix/tv/${tmdb_id}/${season}/${episode}`
       : `/yflix/movie/${tmdb_id}`;
 
+  const cached = lookupCache.get(path);
+  if (cached && Date.now() - cached.at < LOOKUP_TTL_MS) return cached.value;
+  const value = await lookupCatflixStream(path, timeoutMs);
+  lookupCache.set(path, { at: Date.now(), value });
+  return value;
+}
+
+async function lookupCatflixStream(path, timeoutMs) {
   const apiUrl = `${API_BASE}${path}`;
   let json;
   try {
@@ -88,6 +107,17 @@ export async function fetchCatflixStream(type, tmdb_id, season, episode, timeout
     } catch {
       payload = { url: decoded };
     }
+  }
+
+  // The API wraps its own errors in the same "encrypted" envelope, e.g.
+  // {"error":"IP blocked for excessive rate limiting. Try again in 7m49s."}
+  // (it rate-limits per source IP, and the relay's egress IP is shared).
+  // Surface those as throws so the caller treats them as transient rather
+  // than "this title has no Catflix stream".
+  if (payload && typeof payload === "object" && payload.error) {
+    const err = new Error(`catflix API error: ${payload.error}`);
+    err.status = /rate limit/i.test(payload.error) ? 429 : 502;
+    throw err;
   }
 
   const url = typeof payload?.url === "string" ? payload.url.trim() : "";
