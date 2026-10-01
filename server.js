@@ -496,20 +496,20 @@ async function scrapeCatflix(type, tmdb_id, season, episode) {
   }
 }
 
-// Merge every reachable stream from all sources, best working rendition
-// first. Compared by quality *tier* rather than raw pixels so a 1280x718
-// encode and a 1280x720 one count as the same 720p. On equal tier Catflix
-// is preferred: its encodes are the ones viewers judged better, and its
-// 1080p sits at ~2.7 Mbps where vaplayer advertises ~6.8 Mbps — a rate ABR
-// often refuses through this proxy, leaving the player parked on 720p.
-// vaplayer only wins with a strictly higher working tier, and its mirrors
-// always remain in the list as fallbacks.
+// Merge every reachable stream from all sources. Catflix is always the
+// primary source when it has any working stream: its encodes are the ones
+// viewers judged better, and its 1080p sits at ~2.7 Mbps where vaplayer
+// advertises ~6.8 Mbps — a rate ABR often refuses through this proxy,
+// leaving the player parked on 720p. vaplayer is the fallback: it follows
+// in `mirrors` for every title, and becomes hls_url only when Catflix has
+// nothing (no entry, dead manifest, relay rate-limited). Within a source,
+// higher working tier first.
 const SOURCE_PRIORITY = { catflix: 0, vaplayer: 1 };
 function rankStreams(...streamLists) {
   return streamLists
     .flat()
     .map((s, index) => ({ ...s, index, tier: qualityTier(s), prio: SOURCE_PRIORITY[s.source] ?? 9 }))
-    .sort((a, b) => b.tier - a.tier || a.prio - b.prio || a.index - b.index)
+    .sort((a, b) => a.prio - b.prio || b.tier - a.tier || a.index - b.index)
     .map(({ index, tier, prio, ...s }) => s);
 }
 
