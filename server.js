@@ -50,23 +50,6 @@ export const LANGUAGE_NAMES = {
 
 export const COMMON_LANGUAGES = Object.keys(LANGUAGE_NAMES);
 
-// Simple in-memory cache to avoid re-fetching same query repeatedly (15
-// minutes). Entries are only checked for expiry on read, so sweep expired
-// ones periodically — otherwise every distinct title ever requested stays
-// resident (each response is ~15KB of subtitle URLs) and the process grows
-// without bound.
-const CACHE_TTL_MS = 1000 * 60 * 15;
-const CACHE_TTL_TRANSIENT_MS = 1000 * 60 * 2;
-const cache = new Map();
-const cacheEntryExpired = (entry, now = Date.now()) =>
-  now - entry.timestamp >= (entry.ttl ?? CACHE_TTL_MS);
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, entry] of cache) {
-    if (cacheEntryExpired(entry, now)) cache.delete(key);
-  }
-}, 60 * 1000).unref();
-
 // Each upstream CDN wants to see the Referer of the player it was minted
 // for. vaplayer.ru mirrors check for nextgencloudfabric.com; the Catflix
 // chain (pwcloud.animanga.fun manifests, segments disguised as PNGs on
@@ -483,9 +466,9 @@ async function scrapeVaplayerAPI(type, tmdb_id, season, episode) {
 //
 // Returns { streams, transient }: `transient` is set when Catflix *had* a URL
 // for this title but we couldn't confirm it in time (its CDN stalls for
-// 15-20s at random), or the API itself errored. The caller uses that to
-// shorten the cache TTL so a retry a couple of minutes later can pick up
-// the 1080p instead of pinning the 720p fallback for the full window.
+// 15-20s at random), or the API itself errored — i.e. a retry might do
+// better. (Unused since /extract stopped caching responses; kept so a
+// caller can still tell "no entry" from "couldn't reach it".)
 async function scrapeCatflix(type, tmdb_id, season, episode) {
   try {
     const stream = await fetchCatflixStream(type, tmdb_id, season, episode);
@@ -881,7 +864,7 @@ app.get("/extract", async (req, res) => {
   // Optional source pin: ?source=catflix|superstream|vaplayer makes hls_url
   // come from that source instead of the best-ranked one. `mirrors` always
   // lists every source that has a stream, so a UI can offer a picker.
-  const { source: wantedSource, ...lookupQuery } = req.query;
+  const wantedSource = req.query.source;
   if (wantedSource !== undefined && !(wantedSource in SOURCE_PRIORITY)) {
     return res.status(400).json({
       success: false,
@@ -892,15 +875,9 @@ app.get("/extract", async (req, res) => {
     });
   }
 
-  // The source pin is applied on the way out, so one lookup (and one cache
-  // entry) serves every ?source= variant of the same title.
-  const cacheKey = JSON.stringify(lookupQuery);
-  const cached = cache.get(cacheKey);
-  if (cached && !cacheEntryExpired(cached)) {
-    console.log("Serving from cache");
-    return res.json(applySourceFilter(cached.response, wantedSource));
-  }
-
+  // No response caching: every call re-resolves all sources so a viewer
+  // always gets the live state of each CDN (what's up, what quality is
+  // actually reachable right now) rather than a snapshot from minutes ago.
   try {
     // All sources are independent, so resolve them concurrently. vaplayer
     // also supplies title/imdb_id/subtitles used further down, so it always
@@ -914,7 +891,6 @@ app.get("/extract", async (req, res) => {
       scrapeCatflix(type, tmdb_id, season, episode),
       scrapeSuperstream(type, tmdb_id, season, episode),
     ]);
-    const secondaryTransient = catflix.transient || superstream.transient;
 
     const streams = rankStreams(result.streams, catflix.streams, superstream.streams);
     const best = streams[0] || null;
@@ -949,7 +925,6 @@ app.get("/extract", async (req, res) => {
     const extractorSubs = Array.isArray(result.subtitles) ? result.subtitles : [];
     const host = `${req.protocol}://${req.get("host")}`;
     let subtitles = [...extractorSubs];
-    let errored = false;
 
     try {
       const wcands =
@@ -963,7 +938,6 @@ app.get("/extract", async (req, res) => {
       );
     } catch (err) {
       console.error("[extract] Wyzie subtitle lookup failed:", err.message);
-      errored = true;
     }
 
     // The heavy scrapers (YIFY zip-validation for movies, addic7ed for TV) take
@@ -980,7 +954,6 @@ app.get("/extract", async (req, res) => {
           );
         } catch (err) {
           console.error("[extract] YIFY subtitle fallback failed:", err.message);
-          errored = true;
         }
       } else if (type === "tv" && result.title) {
         let addic7edFailed = false;
@@ -993,7 +966,6 @@ app.get("/extract", async (req, res) => {
         } catch (err) {
           console.error("[extract] addic7ed subtitle fallback failed:", err.message);
           addic7edFailed = true;
-          errored = true;
         }
         if (subtitles.length === 0 && addic7edFailed) {
           subtitles = [
@@ -1002,9 +974,6 @@ app.get("/extract", async (req, res) => {
         }
       }
     }
-
-    // Don't cache a transient lookup failure that left us with nothing.
-    const subtitleLookupFailed = subtitles.length === 0 && errored;
 
     const response = {
       success: !!best,
@@ -1015,20 +984,6 @@ app.get("/extract", async (req, res) => {
       subtitles,
       error: best ? null : result.error || "No stream found",
     };
-
-    // Don't cache a transient subtitle-lookup failure as if it were a
-    // final answer — that would keep serving "no subtitles" for the rest
-    // of the 15-minute window even though a retry would likely succeed.
-    // Likewise, when Catflix/Superstream flaked (their CDNs stall at random)
-    // we did get a playable answer, but possibly a lower quality than exists
-    // — cache it only briefly so the next viewer re-tries for the 1080p.
-    if (response.success && !subtitleLookupFailed) {
-      cache.set(cacheKey, {
-        timestamp: Date.now(),
-        ttl: secondaryTransient ? CACHE_TTL_TRANSIENT_MS : CACHE_TTL_MS,
-        response,
-      });
-    }
 
     res.json(applySourceFilter(response, wantedSource));
   } catch (err) {
