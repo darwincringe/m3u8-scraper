@@ -65,14 +65,16 @@ const UPSTREAM_HEADER_RULES = [
       Accept: "application/vnd.apple.mpegurl,application/x-mpegURL,*/*",
     },
   },
-  // Superstream's CDN (lookmovie2) doesn't check Referer; just look like a
-  // browser.
-  {
-    test: /(^|\.)laterascent\.site$/i,
-    headers: { "User-Agent": BROWSER_UA },
-  },
 ];
-const DEFAULT_UPSTREAM_HEADERS = { Referer: "https://nextgencloudfabric.com/" };
+// Everything else gets vaplayer's Referer plus a browser User-Agent. The
+// UA matters: Superstream's CDN (lookmovie2; srv*.laterascent.site,
+// srv*.superoled.site, hostnames rotate so they can't be matched by rule)
+// answers node-fetch's default UA with 403, and the vaplayer mirrors don't
+// mind a browser UA.
+const DEFAULT_UPSTREAM_HEADERS = {
+  Referer: "https://nextgencloudfabric.com/",
+  "User-Agent": BROWSER_UA,
+};
 
 // Shared keep-alive agents for every upstream request. node-fetch's default
 // opens a brand-new TLS connection per request — for a proxy that fetches
