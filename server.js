@@ -581,6 +581,26 @@ function decodeRenditions(param) {
 // hls_url only when neither of the others has anything (no entry, dead
 // manifest, relay rate-limited). Within a source, higher working tier first.
 const SOURCE_PRIORITY = { catflix: 0, superstream: 1, vaplayer: 2 };
+
+// Re-point a finished /extract response at one specific source (the
+// ?source= pin). `mirrors` is left intact so the client still sees every
+// option; when the pinned source has no stream for this title the response
+// says so instead of silently handing back another source.
+function applySourceFilter(response, source) {
+  if (!source || !response.success) return response;
+  const pick = response.mirrors.find((m) => m.source === source);
+  if (!pick) {
+    return {
+      ...response,
+      success: false,
+      hls_url: null,
+      source: null,
+      quality: null,
+      error: `No stream from source "${source}" for this title`,
+    };
+  }
+  return { ...response, hls_url: pick.hls_url, source: pick.source, quality: pick.quality, error: null };
+}
 function rankStreams(...streamLists) {
   return streamLists
     .flat()
@@ -858,11 +878,27 @@ app.get("/extract", async (req, res) => {
     });
   }
 
-  const cacheKey = JSON.stringify(req.query);
+  // Optional source pin: ?source=catflix|superstream|vaplayer makes hls_url
+  // come from that source instead of the best-ranked one. `mirrors` always
+  // lists every source that has a stream, so a UI can offer a picker.
+  const { source: wantedSource, ...lookupQuery } = req.query;
+  if (wantedSource !== undefined && !(wantedSource in SOURCE_PRIORITY)) {
+    return res.status(400).json({
+      success: false,
+      error: `Unknown source "${wantedSource}"; expected one of ${Object.keys(SOURCE_PRIORITY).join(", ")}`,
+      hls_url: null,
+      mirrors: [],
+      subtitles: [],
+    });
+  }
+
+  // The source pin is applied on the way out, so one lookup (and one cache
+  // entry) serves every ?source= variant of the same title.
+  const cacheKey = JSON.stringify(lookupQuery);
   const cached = cache.get(cacheKey);
   if (cached && !cacheEntryExpired(cached)) {
     console.log("Serving from cache");
-    return res.json(cached.response);
+    return res.json(applySourceFilter(cached.response, wantedSource));
   }
 
   try {
@@ -898,10 +934,14 @@ app.get("/extract", async (req, res) => {
         ? `${origin}/hls-master?r=${encodeRenditions(s.renditions)}`
         : `${origin}/hls-proxy?url=${encodeURIComponent(s.url)}`;
     const proxiedHlsUrl = best ? proxied(best) : null;
-    // Every reachable stream from every source, proxied the same way as
-    // hls_url — hls_url is always mirrors[0], kept as its own field for
-    // backward compatibility with existing consumers that only read hls_url.
-    const proxiedMirrors = streams.map(proxied);
+    // One entry per source that has a working stream, in priority order,
+    // each pointing at that source's best stream. hls_url is always
+    // mirrors[0].hls_url (unless ?source= pins another one).
+    const mirrors = [];
+    for (const s of streams) {
+      if (mirrors.some((m) => m.source === s.source)) continue;
+      mirrors.push({ hls_url: proxied(s), source: s.source, quality: qualityLabel(s) });
+    }
 
     // Subtitles: append Wyzie ON TOP of whatever the extractor returned ("the
     // other subtitles") — Wyzie ALWAYS runs for both movies and TV (it's a
@@ -969,7 +1009,7 @@ app.get("/extract", async (req, res) => {
     const response = {
       success: !!best,
       hls_url: proxiedHlsUrl,
-      mirrors: proxiedMirrors,
+      mirrors,
       source: best ? best.source : null,
       quality: best ? qualityLabel(best) : null,
       subtitles,
@@ -990,7 +1030,7 @@ app.get("/extract", async (req, res) => {
       });
     }
 
-    res.json(response);
+    res.json(applySourceFilter(response, wantedSource));
   } catch (err) {
     res.status(500).json({
       success: false,
