@@ -498,16 +498,19 @@ async function scrapeCatflix(type, tmdb_id, season, episode) {
 
 // Merge every reachable stream from all sources, best working rendition
 // first. Compared by quality *tier* rather than raw pixels so a 1280x718
-// encode and a 1280x720 one count as the same 720p; vaplayer streams come
-// first in the input, so on equal tier the long-standing source keeps
-// priority (its mirrors are known-good and its CDN is the one this proxy
-// has been tuned against).
+// encode and a 1280x720 one count as the same 720p. On equal tier Catflix
+// is preferred: its encodes are the ones viewers judged better, and its
+// 1080p sits at ~2.7 Mbps where vaplayer advertises ~6.8 Mbps — a rate ABR
+// often refuses through this proxy, leaving the player parked on 720p.
+// vaplayer only wins with a strictly higher working tier, and its mirrors
+// always remain in the list as fallbacks.
+const SOURCE_PRIORITY = { catflix: 0, vaplayer: 1 };
 function rankStreams(...streamLists) {
   return streamLists
     .flat()
-    .map((s, index) => ({ ...s, index, tier: qualityTier(s) }))
-    .sort((a, b) => b.tier - a.tier || a.index - b.index)
-    .map(({ index, tier, ...s }) => s);
+    .map((s, index) => ({ ...s, index, tier: qualityTier(s), prio: SOURCE_PRIORITY[s.source] ?? 9 }))
+    .sort((a, b) => b.tier - a.tier || a.prio - b.prio || a.index - b.index)
+    .map(({ index, tier, prio, ...s }) => s);
 }
 
 // Some CDN mirrors (e.g. startupscalingsystem.website) intermittently drop
