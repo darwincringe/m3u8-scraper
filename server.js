@@ -556,16 +556,16 @@ function decodeRenditions(param) {
   }
 }
 
-// Merge every reachable stream from all sources. Catflix is always the
-// primary source when it has any working stream: its encodes are the ones
-// viewers judged better, and its 1080p sits at ~2.7 Mbps where vaplayer
-// advertises ~6.8 Mbps — a rate ABR often refuses through this proxy,
-// leaving the player parked on 720p. Superstream is next: real ~3.5 Mbps
-// 1080p where vaplayer's "1080p" is often a ~1 Mbps YTS re-encode. vaplayer
-// is the last fallback: it follows in `mirrors` for every title, and becomes
-// hls_url only when neither of the others has anything (no entry, dead
-// manifest, relay rate-limited). Within a source, higher working tier first.
-const SOURCE_PRIORITY = { catflix: 0, superstream: 1, vaplayer: 2 };
+// Merge every reachable stream from all sources, ordered by source
+// priority, then by highest working tier within a source. vaplayer is the
+// default: its CDN is the one that reliably delivers (1-1.6 MB/s from the
+// droplet) and it has an entry for nearly everything, so it is the safest
+// thing to autoplay. Catflix follows — better 1080p encodes, but spotty
+// coverage and a CDN that stalls at random. Superstream last: broad real-
+// 1080p coverage but its CDN throttles to ~70-270 KB/s per connection, so
+// it buffers unless the viewer picks it deliberately. Every source with a
+// working stream is still exposed in `mirrors` for the picker / ?source=.
+const SOURCE_PRIORITY = { vaplayer: 0, catflix: 1, superstream: 2 };
 
 // Re-point a finished /extract response at one specific source (the
 // ?source= pin). `mirrors` is left intact so the client still sees every
