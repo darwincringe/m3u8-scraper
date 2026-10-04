@@ -21,6 +21,7 @@ import {
 import { registerSyncRoutes } from "./srctvSync.js";
 import { fetchCatflixStream, fetchSuperstreamStreams } from "./utils/catflix.js";
 import { Readable } from "stream";
+import { readFileSync } from "fs";
 import http from "http";
 import https from "https";
 dotenv.config();
@@ -291,7 +292,10 @@ async function fetchVaplayerJSON(apiUrl, timeoutMs = 6000) {
       },
       signal: controller.signal,
     });
-    if (!res.ok) throw new Error(`streamdata API returned ${res.status}`);
+    if (!res.ok) {
+      discardBody(res);
+      throw new Error(`streamdata API returned ${res.status}`);
+    }
     return await res.json();
   } finally {
     clearTimeout(timeout);
@@ -597,16 +601,30 @@ function rankStreams(...streamLists) {
 // Some CDN mirrors (e.g. startupscalingsystem.website) intermittently drop
 // connections on individual segment requests. Retry a couple of times
 // before giving up, since one dropped connection shouldn't kill playback.
-async function fetchUpstreamWithRetry(target, attempts = 3) {
+//
+// `signal` aborts the in-flight attempt (the client went away); each attempt
+// also gives up on its own if the upstream hasn't produced headers within
+// UPSTREAM_HEADERS_TIMEOUT_MS, so a stalled CDN can't pin a socket open.
+const UPSTREAM_HEADERS_TIMEOUT_MS = 20000;
+async function fetchUpstreamWithRetry(target, attempts = 3, signal) {
   let lastError;
   for (let i = 0; i < attempts; i++) {
+    if (signal?.aborted) throw new Error("client disconnected");
+    const attempt = new AbortController();
+    const onAbort = () => attempt.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(onAbort, UPSTREAM_HEADERS_TIMEOUT_MS);
     try {
-      const upstream = await fetchUpstream(target);
+      const upstream = await fetchUpstream(target, { signal: attempt.signal });
       if (upstream.ok) return upstream;
       discardBody(upstream);
       lastError = new Error(`Upstream fetch failed with status ${upstream.status}`);
     } catch (err) {
       lastError = err;
+      if (signal?.aborted) throw new Error("client disconnected");
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
     }
     if (i < attempts - 1) await new Promise((r) => setTimeout(r, 200 * (i + 1)));
   }
@@ -719,13 +737,37 @@ app.get("/hls-master", async (req, res) => {
   }
 });
 
+//
+// The upstream's lifetime is tied to the client's from the first line:
+// players abort segment requests all the time (seeks, quality switches),
+// often while we're still waiting on a slow CDN. If that abort isn't
+// propagated, the upstream body is never read or destroyed and the whole
+// segment sits in kernel socket buffers (CLOSE_WAIT) plus node's stream
+// buffers — about 1-10 MB per zombie — until the process restarts. That is
+// exactly how a 1 GB host ends up swapped out after a couple of days.
 app.get("/hls-proxy", async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).send("Missing url param");
 
+  const client = new AbortController();
+  let upstream = null;
+  res.on("close", () => {
+    client.abort();
+    if (upstream) discardBody(upstream);
+  });
+
   try {
-    const upstream = await fetchUpstreamWithRetry(target);
+    upstream = await fetchUpstreamWithRetry(target, 3, client.signal);
+    if (res.destroyed) {
+      discardBody(upstream);
+      return;
+    }
     const { head, iterator, done } = await peekStream(upstream.body, 4096);
+    if (res.destroyed) {
+      await iterator.return?.();
+      discardBody(upstream);
+      return;
+    }
 
     const isPlaylist = head.toString("utf8", 0, 16).trimStart().startsWith("#EXTM3U");
 
@@ -831,6 +873,7 @@ app.get("/hls-proxy", async (req, res) => {
     res.on("close", () => body.destroy());
     body.pipe(res);
   } catch (err) {
+    if (res.destroyed) return; // client left; nothing to report or send
     console.error("[hls-proxy] Error:", err.message);
     if (!res.headersSent) res.status(500).send("Proxy error");
   }
@@ -1298,6 +1341,51 @@ app.get("/segments", async (req, res) => {
     res.status(502).json({ error: "introdb fetch failed" });
   }
 });
+
+// Memory watchdog. PM2's --max-memory-restart compares RSS only, and once
+// the host starts swapping, RSS *shrinks* (pages move to swap) while the
+// process keeps growing — so the restart never fires and the box ends up
+// thrashing with 10 MB free. Count RSS + swap from /proc instead and exit
+// (PM2 restarts us) once we're over the line. Also report open upstream
+// sockets so a leak is visible in the logs before it hurts.
+const MEM_LIMIT_MB = parseInt(process.env.MEM_LIMIT_MB || "450", 10);
+function processMemoryMB() {
+  try {
+    const status = readFileSync("/proc/self/status", "utf8");
+    const kb = (key) => parseInt(new RegExp(`^${key}:\\s+(\\d+)`, "m").exec(status)?.[1] || "0", 10);
+    const rss = kb("VmRSS");
+    const swap = kb("VmSwap");
+    return { rss: rss / 1024, swap: swap / 1024, total: (rss + swap) / 1024 };
+  } catch {
+    const rss = process.memoryUsage().rss / 1024 / 1024;
+    return { rss, swap: 0, total: rss };
+  }
+}
+function upstreamSocketCount() {
+  let n = 0;
+  for (const agent of Object.values(upstreamAgents)) {
+    for (const list of Object.values(agent.sockets)) n += list.length;
+    for (const list of Object.values(agent.freeSockets)) n += list.length;
+  }
+  return n;
+}
+setInterval(() => {
+  const mem = processMemoryMB();
+  if (mem.total > MEM_LIMIT_MB) {
+    console.error(
+      `[watchdog] memory ${mem.total.toFixed(0)} MB (rss ${mem.rss.toFixed(0)} + swap ${mem.swap.toFixed(0)}) ` +
+        `exceeds ${MEM_LIMIT_MB} MB with ${upstreamSocketCount()} upstream sockets; exiting for restart`
+    );
+    process.exit(1);
+  }
+}, 30 * 1000).unref();
+setInterval(() => {
+  const mem = processMemoryMB();
+  console.log(
+    `[watchdog] mem ${mem.total.toFixed(0)} MB (rss ${mem.rss.toFixed(0)}, swap ${mem.swap.toFixed(0)}), ` +
+      `upstream sockets ${upstreamSocketCount()}`
+  );
+}, 10 * 60 * 1000).unref();
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);

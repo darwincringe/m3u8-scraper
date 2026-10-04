@@ -52,6 +52,10 @@ async function fetchJSON(url, timeoutMs) {
   try {
     const res = await fetch(url, { headers: REQUEST_HEADERS, signal: controller.signal });
     if (!res.ok) {
+      // Release the socket: an unread body keeps it (and its buffers) alive.
+      try {
+        res.body?.destroy();
+      } catch {}
       const err = new Error(`vidnest API returned ${res.status}`);
       err.status = res.status;
       throw err;
