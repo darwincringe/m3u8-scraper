@@ -15,8 +15,29 @@
 //   1080p runs ~3.5 Mbps where vaplayer's "1080p" YTS re-encodes sit around
 //   1 Mbps, so it's the better fallback when Catflix has no entry.
 import fetch from "node-fetch";
+import crypto from "crypto";
 
 const API_BASE = "https://new.vidnest.fun";
+
+// Since Oct 2026 the API rejects calls without a `_n` query param (403
+// "missing or invalid nonce") and answers in a "v2" envelope
+// {v: 2, d: <base64url iv||ciphertext||tag>, n: <nonce>} — AES-256-GCM with
+// key SHA-256("<n>|<secret>"). The nonce is just 16 random bytes the client
+// picks; the secret is a constant from their bundle (withStreamNonceUrl /
+// decryptCipherResponse in vidnest's chunk). Override with VIDNEST_SECRET
+// if they rotate it.
+const V2_SECRET = process.env.VIDNEST_SECRET || "F9k2mR8vL4qP7wY1zN0fG3bS6tH5jC8d_x4R7vN2mP9qL1";
+const newNonce = () => crypto.randomBytes(16).toString("base64url");
+function decryptV2(d, n) {
+  const key = crypto.createHash("sha256").update(`${n}|${V2_SECRET}`).digest();
+  const buf = Buffer.from(d, "base64url");
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(buf.length - 16);
+  const ciphertext = buf.subarray(12, buf.length - 16);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
+}
 
 // new.vidnest.fun sits behind a Cloudflare WAF rule that hard-blocks
 // datacenter IPs (403 "Sorry, you have been blocked" for DigitalOcean etc.),
@@ -102,8 +123,11 @@ export async function fetchCatflixStream(type, tmdb_id, season, episode, timeout
   return { url, headers: payload.headers || {} };
 }
 
-// Superstream: returns [{ url, quality, height }] (one media playlist per
-// quality, best first) or null when the source has nothing for this title.
+// Superstream: returns [{ url, quality, height, language }] best first, or
+// null when the source has nothing for this title. Two payload shapes have
+// been seen: one bare media playlist per `quality` ("1080p"/"720p"/...),
+// and — since their backend switched in Oct 2026 — one master playlist per
+// `language` with no quality tag (height 0; the caller probes the master).
 export async function fetchSuperstreamStreams(type, tmdb_id, season, episode, timeoutMs = 8000) {
   const payload = await fetchVidnestPayload(
     titlePath("superstream", type, tmdb_id, season, episode),
@@ -117,13 +141,14 @@ export async function fetchSuperstreamStreams(type, tmdb_id, season, episode, ti
       url: s.url.trim(),
       quality: String(s.quality || "").trim(),
       height: parseInt(/(\d{3,4})p/i.exec(s.quality || "")?.[1] || "0", 10),
+      language: String(s.language || "").trim(),
     }))
     .sort((a, b) => b.height - a.height);
   return streams.length ? streams : null;
 }
 
 async function lookupVidnestPayload(path, timeoutMs) {
-  const apiUrl = `${API_BASE}${path}`;
+  const apiUrl = `${API_BASE}${path}?_n=${newNonce()}`;
   let json;
   try {
     json = await fetchJSON(apiUrl, timeoutMs);
@@ -140,7 +165,19 @@ async function lookupVidnestPayload(path, timeoutMs) {
   }
 
   let payload = json;
-  if (json?.encrypted) {
+  if (json?.v === 2 && typeof json.d === "string") {
+    let decoded;
+    try {
+      decoded = decryptV2(json.d, json.n);
+    } catch (e) {
+      throw new Error(`vidnest v2 decrypt failed (${e.message}); secret rotated?`);
+    }
+    try {
+      payload = JSON.parse(decoded);
+    } catch {
+      payload = { url: decoded };
+    }
+  } else if (json?.encrypted) {
     if (typeof json.data !== "string") throw new Error("vidnest response missing data");
     const decoded = decodeVidnestCipher(json.data);
     try {

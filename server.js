@@ -510,8 +510,26 @@ async function scrapeSuperstream(type, tmdb_id, season, episode) {
   try {
     const list = await fetchSuperstreamStreams(type, tmdb_id, season, episode);
     if (!list) return { streams: [], transient: false };
+
+    // Entries without a quality tag are master playlists (one per audio
+    // language); probe them like any other master and publish each as a
+    // normal stream. Only quality-tagged bare media playlists need the
+    // synthetic-master treatment below.
+    const masters = list.filter((s) => !s.height);
+    const tagged = list.filter((s) => s.height);
+    const masterStreams = masters.length
+      ? (await probeStreamUrls(masters.map((s) => s.url), PROBE_TIMEOUT_MS, PROBE_ATTEMPTS)).map((s) => ({
+          ...s,
+          source: "superstream",
+        }))
+      : [];
+    if (!tagged.length) {
+      if (!masterStreams.length) console.warn(`[superstream] no reachable master for ${type} ${tmdb_id}`);
+      return { streams: masterStreams, transient: masterStreams.length === 0 };
+    }
+
     const probed = await Promise.all(
-      list.map(async (s) => {
+      tagged.map(async (s) => {
         const probe = await probePlaylist(s.url, PROBE_TIMEOUT_MS, PROBE_ATTEMPTS, { headOnly: true });
         const tier = SUPERSTREAM_TIERS[s.height] || { width: 0, height: s.height, bandwidth: 1_500_000 };
         return { ...tier, url: s.url, status: probe.status };
@@ -522,7 +540,7 @@ async function scrapeSuperstream(type, tmdb_id, season, episode) {
     const renditions = probed.filter((r) => r.status !== "dead");
     if (!renditions.some((r) => r.status === "ok")) {
       console.warn(`[superstream] no reachable rendition for ${type} ${tmdb_id}`);
-      return { streams: [], transient: true };
+      return { streams: masterStreams, transient: true };
     }
     const best = renditions.reduce((a, b) => (b.width * b.height > a.width * a.height ? b : a));
     return {
@@ -535,6 +553,7 @@ async function scrapeSuperstream(type, tmdb_id, season, episode) {
           source: "superstream",
           renditions: renditions.map(({ url, width, height, bandwidth }) => ({ url, width, height, bandwidth })),
         },
+        ...masterStreams,
       ],
       transient: false,
     };
