@@ -19,7 +19,7 @@ import {
   downloadWyzieSubtitleSRT,
 } from "./utils/wyzieSubtitles.js";
 import { registerSyncRoutes } from "./srctvSync.js";
-import { fetchCatflixStream, fetchSuperstreamStreams } from "./utils/catflix.js";
+import { fetchCatflixStream, fetchFlixhqStreams, fetchOphimStreams } from "./utils/catflix.js";
 import { Readable } from "stream";
 import { readFileSync } from "fs";
 import http from "http";
@@ -67,11 +67,9 @@ const UPSTREAM_HEADER_RULES = [
     },
   },
 ];
-// Everything else gets vaplayer's Referer plus a browser User-Agent. The
-// UA matters: Superstream's CDN (lookmovie2; srv*.laterascent.site,
-// srv*.superoled.site, hostnames rotate so they can't be matched by rule)
-// answers node-fetch's default UA with 403, and the vaplayer mirrors don't
-// mind a browser UA.
+// Everything else — vaplayer mirrors and the Cloudflare Workers fronting
+// flixhq/ophim — gets vaplayer's Referer plus a browser User-Agent (some
+// CDNs 403 node-fetch's default UA; none of ours mind a browser one).
 const DEFAULT_UPSTREAM_HEADERS = {
   Referer: "https://nextgencloudfabric.com/",
   "User-Agent": BROWSER_UA,
@@ -491,104 +489,40 @@ async function scrapeCatflix(type, tmdb_id, season, episode) {
   }
 }
 
-// Superstream (also via vidnest.fun's API) hands out one bare media
-// playlist per quality instead of a master, so a player given a single
-// one of them would have no ABR. We probe each quality's playlist head,
-// keep the live ones, and publish the lot as ONE stream whose `renditions`
-// /extract turns into a synthetic master via /hls-master (see below).
-// Nominal RESOLUTION/BANDWIDTH per advertised quality label — measured
-// segment sizes put Superstream's 1080p at ~3.5 Mbps, 720p ~2.1, 480p ~1.2.
-const SUPERSTREAM_TIERS = {
-  2160: { width: 3840, height: 2160, bandwidth: 12_000_000 },
-  1440: { width: 2560, height: 1440, bandwidth: 7_000_000 },
-  1080: { width: 1920, height: 1080, bandwidth: 4_000_000 },
-  720: { width: 1280, height: 720, bandwidth: 2_200_000 },
-  480: { width: 854, height: 480, bandwidth: 1_200_000 },
-  360: { width: 640, height: 360, bandwidth: 800_000 },
-};
-async function scrapeSuperstream(type, tmdb_id, season, episode) {
+// flixhq and ophim (also via vidnest.fun's API) each hand out ordinary
+// HLS masters served through Cloudflare Workers, so they go through the
+// same master-aware probe as everything else. Same contract as
+// scrapeCatflix: never throws; `transient` means the source *had* a URL
+// (or the API errored) but nothing could be confirmed right now.
+async function scrapeVidnestMasters(source, fetchMasters, type, tmdb_id, season, episode) {
   try {
-    const list = await fetchSuperstreamStreams(type, tmdb_id, season, episode);
-    if (!list) return { streams: [], transient: false };
-
-    // Entries without a quality tag are master playlists (one per audio
-    // language); probe them like any other master and publish each as a
-    // normal stream. Only quality-tagged bare media playlists need the
-    // synthetic-master treatment below.
-    const masters = list.filter((s) => !s.height);
-    const tagged = list.filter((s) => s.height);
-    const masterStreams = masters.length
-      ? (await probeStreamUrls(masters.map((s) => s.url), PROBE_TIMEOUT_MS, PROBE_ATTEMPTS)).map((s) => ({
-          ...s,
-          source: "superstream",
-        }))
-      : [];
-    if (!tagged.length) {
-      if (!masterStreams.length) console.warn(`[superstream] no reachable master for ${type} ${tmdb_id}`);
-      return { streams: masterStreams, transient: masterStreams.length === 0 };
-    }
-
-    const probed = await Promise.all(
-      tagged.map(async (s) => {
-        const probe = await probePlaylist(s.url, PROBE_TIMEOUT_MS, PROBE_ATTEMPTS, { headOnly: true });
-        const tier = SUPERSTREAM_TIERS[s.height] || { width: 0, height: s.height, bandwidth: 1_500_000 };
-        return { ...tier, url: s.url, status: probe.status };
-      })
-    );
-    // Require at least one playlist to have answered: if the whole CDN is
-    // timing out right now, don't rank it above a source that works.
-    const renditions = probed.filter((r) => r.status !== "dead");
-    if (!renditions.some((r) => r.status === "ok")) {
-      console.warn(`[superstream] no reachable rendition for ${type} ${tmdb_id}`);
-      return { streams: masterStreams, transient: true };
-    }
-    const best = renditions.reduce((a, b) => (b.width * b.height > a.width * a.height ? b : a));
-    return {
-      streams: [
-        {
-          url: best.url,
-          width: best.width,
-          height: best.height,
-          pixels: best.width * best.height,
-          source: "superstream",
-          renditions: renditions.map(({ url, width, height, bandwidth }) => ({ url, width, height, bandwidth })),
-        },
-        ...masterStreams,
-      ],
-      transient: false,
-    };
+    const masters = await fetchMasters(type, tmdb_id, season, episode);
+    if (!masters) return { streams: [], transient: false };
+    const streams = await probeStreamUrls(masters, PROBE_TIMEOUT_MS, PROBE_ATTEMPTS);
+    if (!streams.length) console.warn(`[${source}] manifest unreachable for ${type} ${tmdb_id}`);
+    return { streams: streams.map((s) => ({ ...s, source })), transient: streams.length === 0 };
   } catch (error) {
-    console.error(`[superstream] ${error.message}`);
-    return { streams: [], transient: error.status !== 404 };
+    // vidnest answers 502 for "no entry" and 404 for unknown routes; both
+    // are definitive, not transient.
+    const noEntry = error.status === 404 || error.status === 502;
+    console.error(`[${source}] ${noEntry ? `no entry for ${type} ${tmdb_id}` : error.message}`);
+    return { streams: [], transient: !noEntry };
   }
 }
-
-// Encode a rendition list into the /hls-master query param.
-const encodeRenditions = (renditions) =>
-  Buffer.from(JSON.stringify(renditions), "utf8").toString("base64url");
-function decodeRenditions(param) {
-  try {
-    const list = JSON.parse(Buffer.from(String(param), "base64url").toString("utf8"));
-    if (!Array.isArray(list)) return null;
-    const out = list.filter(
-      (r) => r && typeof r.url === "string" && /^https?:\/\//i.test(r.url)
-    );
-    return out.length ? out : null;
-  } catch {
-    return null;
-  }
-}
+const scrapeFlixhq = (...a) => scrapeVidnestMasters("flixhq", fetchFlixhqStreams, ...a);
+const scrapeOphim = (...a) => scrapeVidnestMasters("ophim", fetchOphimStreams, ...a);
 
 // Merge every reachable stream from all sources, ordered by source
 // priority, then by highest working tier within a source. vaplayer is the
-// default: its CDN is the one that reliably delivers (1-1.6 MB/s from the
-// droplet) and it has an entry for nearly everything, so it is the safest
-// thing to autoplay. Catflix follows — better 1080p encodes, but spotty
-// coverage and a CDN that stalls at random. Superstream last: broad real-
-// 1080p coverage but its CDN throttles to ~70-270 KB/s per connection, so
-// it buffers unless the viewer picks it deliberately. Every source with a
-// working stream is still exposed in `mirrors` for the picker / ?source=.
-const SOURCE_PRIORITY = { vaplayer: 0, catflix: 1, superstream: 2 };
+// default: it has an entry for nearly everything and its CDN is
+// dependable (~1 MB/s from the droplet), so it is the safest autoplay.
+// flixhq next: widest coverage of the alternatives, highest bitrates
+// (1080p ~6-8 Mbps, 2160p on some films) and 10-90 MB/s from the droplet
+// via Cloudflare Workers. Catflix: good 1080p encodes, spotty coverage,
+// CDN stalls at random. ophim: same speed class as flixhq, same upstream
+// family, slightly less coverage. Every source with a working stream is
+// exposed in `mirrors` for the picker / ?source=.
+const SOURCE_PRIORITY = { vaplayer: 0, flixhq: 1, catflix: 2, ophim: 3 };
 
 // Re-point a finished /extract response at one specific source (the
 // ?source= pin). `mirrors` is left intact so the client still sees every
@@ -662,16 +596,26 @@ function findTsSyncOffset(buf) {
   for (let i = 0; i < limit; i++) {
     if (buf[i] !== TS_SYNC_BYTE) continue;
     let ok = true;
+    let checked = 0;
     for (let k = 1; k <= 3 && i + k * TS_PACKET_SIZE < buf.length; k++) {
+      checked++;
       if (buf[i + k * TS_PACKET_SIZE] !== TS_SYNC_BYTE) {
         ok = false;
         break;
       }
     }
-    if (ok) return i;
+    // A lone 0x47 in the tail of the sniffed head proves nothing — any
+    // binary payload has them — so demand at least one verified stride
+    // unless the whole payload is shorter than a packet.
+    if (ok && (checked > 0 || buf.length <= TS_PACKET_SIZE)) return i;
   }
   return -1;
 }
+
+// ISO-BMFF sniff: every MP4/fMP4 payload opens with a box header whose
+// type is one of a handful of four-letter codes.
+const isFmp4Head = (buf) =>
+  buf.length >= 8 && /^(ftyp|styp|moof|moov|sidx|free|skip|emsg|prft)$/.test(buf.toString("latin1", 4, 8));
 
 // Pull at least minBytes off the front of a Readable so we can sniff the
 // payload before deciding how to serve it, and hand back an iterator that
@@ -720,42 +664,6 @@ async function* resumeStream(head, iterator, done) {
 // players (iOS, ExoPlayer) do not. This proxy sniffs the payload rather than
 // trusting names or Content-Type, strips the stub, and re-serves the manifest
 // chain and segments from our own origin with correct headers.
-// Synthetic master for sources that publish one bare media playlist per
-// quality (Superstream). `r` is the base64url JSON list of
-// {url, width, height, bandwidth} /extract produced; each entry becomes a
-// rendition served through /hls-proxy with &variant=1 so the media playlist
-// isn't wrapped again. Renditions whose playlist is known-dead right now
-// are dropped, the same way /hls-proxy prunes a real master.
-app.get("/hls-master", async (req, res) => {
-  const renditions = decodeRenditions(req.query.r);
-  if (!renditions) return res.status(400).send("Missing or invalid r param");
-
-  try {
-    const probed = await Promise.all(
-      renditions.map(async (r) => ({
-        ...r,
-        status: (await probePlaylist(r.url, 6000, 2, { headOnly: true })).status,
-      }))
-    );
-    let live = probed.filter((r) => r.status !== "dead");
-    if (!live.length) live = probed;
-    live.sort((a, b) => (a.bandwidth || 0) - (b.bandwidth || 0));
-
-    const lines = ["#EXTM3U", "#EXT-X-INDEPENDENT-SEGMENTS"];
-    for (const r of live) {
-      const attrs = [`BANDWIDTH=${Math.round(r.bandwidth || 1_500_000)}`];
-      if (r.width && r.height) attrs.push(`RESOLUTION=${r.width}x${r.height}`);
-      lines.push(`#EXT-X-STREAM-INF:${attrs.join(",")}`);
-      lines.push(`/hls-proxy?url=${encodeURIComponent(r.url)}&variant=1`);
-    }
-    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-    res.send(lines.join("\n"));
-  } catch (err) {
-    console.error("[hls-master]", err.message);
-    res.status(502).send("Proxy error");
-  }
-});
-
 //
 // The upstream's lifetime is tied to the client's from the first line:
 // players abort segment requests all the time (seeks, quality switches),
@@ -845,14 +753,22 @@ app.get("/hls-proxy", async (req, res) => {
       // a master keep the &variant flag so the follow-up request is served
       // as media (and not wrapped again); segment URLs in a media playlist
       // need no flag.
+      // fMP4 streams (flixhq/ophim) also reference an init segment via
+      // #EXT-X-MAP:URI="..." — and AES streams a key via #EXT-X-KEY — which
+      // must come through here too, or browsers hit a worker with no CORS.
       const childSuffix = isMaster ? "&variant=1" : "";
+      const proxyUrl = (ref, suffix = "") =>
+        `/hls-proxy?url=${encodeURIComponent(new URL(ref, baseUrl).toString())}${suffix}`;
       const rewritten = text
         .split("\n")
         .map((line) => {
           const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith("#")) return line;
-          const absoluteUrl = new URL(trimmed, baseUrl).toString();
-          return `/hls-proxy?url=${encodeURIComponent(absoluteUrl)}${childSuffix}`;
+          if (!trimmed) return line;
+          if (/^#EXT-X-(MAP|KEY|MEDIA):/i.test(trimmed)) {
+            return line.replace(/URI="([^"]+)"/i, (_, ref) => `URI="${proxyUrl(ref, isMaster ? "&variant=1" : "")}"`);
+          }
+          if (trimmed.startsWith("#")) return line;
+          return proxyUrl(trimmed, childSuffix);
         })
         .join("\n");
 
@@ -866,11 +782,17 @@ app.get("/hls-proxy", async (req, res) => {
     // (some 6MB+ on slow mirrors) delayed the first byte to the player by
     // several seconds, tripping native-player segment timeouts and showing a
     // black screen for titles served by slower mirrors.
-    const syncOffset = findTsSyncOffset(head);
+    //
+    // fMP4 (flixhq/ophim: ISO-BMFF init segment + styp/moof fragments,
+    // often named *.jpg) is passed through byte-for-byte — never trimmed,
+    // since a stray 0x47 inside a fragment is not a TS packet — and must
+    // not be labelled as MPEG-TS or ExoPlayer/Safari pick the wrong demuxer.
+    const isFmp4 = isFmp4Head(head);
+    const syncOffset = isFmp4 ? -1 : findTsSyncOffset(head);
     const skip = syncOffset > 0 ? syncOffset : 0;
     const segmentHead = skip ? head.subarray(skip) : head;
 
-    res.setHeader("Content-Type", "video/mp2t");
+    res.setHeader("Content-Type", isFmp4 ? "video/mp4" : "video/mp2t");
     const contentLength = parseInt(upstream.headers.get("content-length") || "", 10);
     if (Number.isFinite(contentLength) && contentLength >= skip) {
       res.setHeader("Content-Length", String(contentLength - skip));
@@ -925,7 +847,7 @@ app.get("/extract", async (req, res) => {
     });
   }
 
-  // Optional source pin: ?source=catflix|superstream|vaplayer makes hls_url
+  // Optional source pin: ?source=vaplayer|flixhq|catflix|ophim makes hls_url
   // come from that source instead of the best-ranked one. `mirrors` always
   // lists every source that has a stream, so a UI can offer a picker.
   const wantedSource = req.query.source;
@@ -946,17 +868,18 @@ app.get("/extract", async (req, res) => {
     // All sources are independent, so resolve them concurrently. vaplayer
     // also supplies title/imdb_id/subtitles used further down, so it always
     // runs even when another source ends up winning.
-    const [result, catflix, superstream] = await Promise.all([
+    const [result, catflix, flixhq, ophim] = await Promise.all([
       (async () => {
         const resolvedEpisode =
           type === "tv" ? await resolveTVEpisodeIndex(tmdb_id, season, episode) : episode;
         return scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode);
       })(),
       scrapeCatflix(type, tmdb_id, season, episode),
-      scrapeSuperstream(type, tmdb_id, season, episode),
+      scrapeFlixhq(type, tmdb_id, season, episode),
+      scrapeOphim(type, tmdb_id, season, episode),
     ]);
 
-    const streams = rankStreams(result.streams, catflix.streams, superstream.streams);
+    const streams = rankStreams(result.streams, catflix.streams, flixhq.streams, ophim.streams);
     const best = streams[0] || null;
     if (best) {
       console.log(
@@ -965,14 +888,8 @@ app.get("/extract", async (req, res) => {
       );
     }
 
-    // A stream that is a set of per-quality media playlists (Superstream)
-    // is served through /hls-master, which stitches them into one master so
-    // the player still gets ABR; everything else goes straight to /hls-proxy.
     const origin = `${req.protocol}://${req.get("host")}`;
-    const proxied = (s) =>
-      s.renditions
-        ? `${origin}/hls-master?r=${encodeRenditions(s.renditions)}`
-        : `${origin}/hls-proxy?url=${encodeURIComponent(s.url)}`;
+    const proxied = (s) => `${origin}/hls-proxy?url=${encodeURIComponent(s.url)}`;
     const proxiedHlsUrl = best ? proxied(best) : null;
     // One entry per source that has a working stream, in priority order,
     // each pointing at that source's best stream. hls_url is always

@@ -1,19 +1,23 @@
 // Stream sources behind the vidnest.fun embed (one of the six players
 // hurawatch.cz iframes). vidnest's frontend offers a dozen backends, all
-// served from https://new.vidnest.fun/<backend>/{movie|tv}/... and all
-// answering {"data": "<blob>", "encrypted": true}. The "encryption" is just
-// base64 with a shuffled alphabet, reproduced here from their bundle. We use
-// two of them:
+// served from https://new.vidnest.fun/<backend>/{movie|tv}/... behind the
+// same auth/envelope (see below). We use three of them:
 //
-// - "Catflix" (/yflix): consistently exposes a 1920x1080 rendition where
-//   vaplayer.ru tops out at 720p for the same file. Decoded JSON is
-//   {url, headers}; url is an HLS master (usually proxied through
-//   pwcloud.animanga.fun/hls/<base64 upstream>/master.m3u8).
-// - "Superstream" (/superstream, backed by lookmovie2): decoded JSON is
-//   {streams: [{quality: "1080p", url, type: "hls"}], subtitles: [...]}
-//   where each url is a bare *media* playlist on *.laterascent.site. Its
-//   1080p runs ~3.5 Mbps where vaplayer's "1080p" YTS re-encodes sit around
-//   1 Mbps, so it's the better fallback when Catflix has no entry.
+// - "Catflix" (/yflix): good 1080p encodes but spotty coverage. Decoded
+//   JSON is {url, headers}; url is an HLS master (usually proxied through
+//   pwcloud.animanga.fun/hls/<base64 upstream>/master.m3u8), segments on
+//   tiktokcdn.com disguised as PNGs.
+// - "flixhq" (/flixhq, vidnest's "Beta"): {url, quality: "auto", subtitles}
+//   where url is a master on a Cloudflare Worker (*.workers.dev) that
+//   proxies the real CDN. Widest coverage of the three, highest bitrates
+//   (1080p ~6-8 Mbps, 2160p on some films), and 10-90 MB/s from our host.
+// - "ophim" (/ophim, vidnest's "Lamda", aoneroom upstream): {streams:
+//   [{language, quality, type, url}]} — one master per audio language, also
+//   behind a Worker. Same speed class as flixhq, slightly less coverage.
+//
+// (Superstream — one bare media playlist per quality on a throttled CDN —
+// was dropped in Oct 2026 when vidnest swapped it for a French-dub source
+// whose CDN only answers vidnest's own proxy.)
 import fetch from "node-fetch";
 import crypto from "crypto";
 
@@ -123,28 +127,26 @@ export async function fetchCatflixStream(type, tmdb_id, season, episode, timeout
   return { url, headers: payload.headers || {} };
 }
 
-// Superstream: returns [{ url, quality, height, language }] best first, or
-// null when the source has nothing for this title. Two payload shapes have
-// been seen: one bare media playlist per `quality` ("1080p"/"720p"/...),
-// and — since their backend switched in Oct 2026 — one master playlist per
-// `language` with no quality tag (height 0; the caller probes the master).
-export async function fetchSuperstreamStreams(type, tmdb_id, season, episode, timeoutMs = 8000) {
-  const payload = await fetchVidnestPayload(
-    titlePath("superstream", type, tmdb_id, season, episode),
-    timeoutMs
-  );
-  const list = Array.isArray(payload?.streams) ? payload.streams : [];
-  const streams = list
+// flixhq: returns [masterUrl] or null when the source has nothing for this
+// title. The payload is {status: "success", url, quality: "auto"}.
+export async function fetchFlixhqStreams(type, tmdb_id, season, episode, timeoutMs = 8000) {
+  const payload = await fetchVidnestPayload(titlePath("flixhq", type, tmdb_id, season, episode), timeoutMs);
+  const url = typeof payload?.url === "string" ? payload.url.trim() : "";
+  if (!/^https?:\/\//i.test(url)) return null;
+  return [url];
+}
+
+// ophim: returns [masterUrl, ...] (original-language first) or null. The
+// payload is {streams: [{language, quality, type, url}]}, one master per
+// audio language; dubs are skipped unless nothing else is offered.
+export async function fetchOphimStreams(type, tmdb_id, season, episode, timeoutMs = 8000) {
+  const payload = await fetchVidnestPayload(titlePath("ophim", type, tmdb_id, season, episode), timeoutMs);
+  const list = (Array.isArray(payload?.streams) ? payload.streams : [])
     .filter((s) => typeof s?.url === "string" && /^https?:\/\//i.test(s.url.trim()))
-    .filter((s) => !s.type || /hls|m3u8/i.test(s.type))
-    .map((s) => ({
-      url: s.url.trim(),
-      quality: String(s.quality || "").trim(),
-      height: parseInt(/(\d{3,4})p/i.exec(s.quality || "")?.[1] || "0", 10),
-      language: String(s.language || "").trim(),
-    }))
-    .sort((a, b) => b.height - a.height);
-  return streams.length ? streams : null;
+    .filter((s) => !s.type || /hls|m3u8/i.test(s.type));
+  const original = list.filter((s) => /original|multi/i.test(s.language || ""));
+  const chosen = original.length ? original : list;
+  return chosen.length ? chosen.map((s) => s.url.trim()) : null;
 }
 
 async function lookupVidnestPayload(path, timeoutMs) {
