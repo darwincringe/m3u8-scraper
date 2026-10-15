@@ -47,12 +47,20 @@ function decryptV2(d, n) {
 // datacenter IPs (403 "Sorry, you have been blocked" for DigitalOcean etc.),
 // while the stream CDN it points at is open. Requests from Cloudflare Workers
 // egress via Cloudflare's own network and pass that rule, so when the direct
-// call is blocked we retry through a generic fetch-proxy Worker — the same
-// one vidnest's own page uses to load third-party scripts. Override with
-// CATFLIX_RELAY (a URL prefix the target URL is appended to, URL-encoded) if
-// that worker goes away; set it to "off" to disable the fallback.
-const RELAY_PREFIX =
-  process.env.CATFLIX_RELAY || "https://fetch.streaming-1.workers.dev/fetch?url=";
+// call is blocked we retry through a fetch-proxy Worker. CATFLIX_RELAY is a
+// comma-separated list of URL prefixes (the target URL is appended,
+// URL-encoded), tried in order — put our own relay (relay/vidnest-relay.
+// worker.js) first and any third-party one after it as a spare. The
+// default is the generic worker vidnest's own page uses, which went dark
+// on 2026-10-15 (error 1101 on every call) and took every vidnest source
+// down with it, so don't run prod on the default alone. "off" disables the
+// fallback. CATFLIX_RELAY_KEY is sent as X-Relay-Key for relays that want
+// one.
+const RELAY_PREFIXES = (process.env.CATFLIX_RELAY || "https://fetch.streaming-1.workers.dev/fetch?url=")
+  .split(",")
+  .map((s) => s.trim())
+  .filter((s) => s && s !== "off");
+const RELAY_KEY = process.env.CATFLIX_RELAY_KEY || "";
 const REQUEST_HEADERS = {
   Referer: "https://vidnest.fun/",
   Origin: "https://vidnest.fun",
@@ -71,11 +79,11 @@ export function decodeVidnestCipher(blob) {
   return Buffer.from(std, "base64").toString("utf8");
 }
 
-async function fetchJSON(url, timeoutMs) {
+async function fetchJSON(url, timeoutMs, extraHeaders) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { headers: REQUEST_HEADERS, signal: controller.signal });
+    const res = await fetch(url, { headers: { ...REQUEST_HEADERS, ...extraHeaders }, signal: controller.signal });
     if (!res.ok) {
       // Release the socket: an unread body keeps it (and its buffers) alive.
       try {
@@ -96,10 +104,13 @@ async function fetchJSON(url, timeoutMs) {
 // rate-limits per source IP — through the relay that IP is shared with
 // every other user of the Worker, so every call we can skip matters.
 const LOOKUP_TTL_MS = 30 * 60 * 1000;
+const NEGATIVE_TTL_MS = 5 * 60 * 1000; // see fetchVidnestPayload
 const lookupCache = new Map();
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of lookupCache) if (now - v.at >= LOOKUP_TTL_MS) lookupCache.delete(k);
+  for (const [k, v] of lookupCache) {
+    if (now - v.at >= (v.error ? NEGATIVE_TTL_MS : LOOKUP_TTL_MS)) lookupCache.delete(k);
+  }
 }, 60 * 1000).unref();
 
 function titlePath(backend, type, tmdb_id, season, episode) {
@@ -110,13 +121,41 @@ function titlePath(backend, type, tmdb_id, season, episode) {
 
 // Decoded payload for one backend/title, memoised. Network/parse errors
 // are thrown so the caller can log them.
+//
+// "No entry" answers (404, or the 502 vidnest returns when a backend has
+// nothing for the title) are memoised too, for a shorter while: their
+// backends scrape on demand and a miss can take 10s+, so without this a
+// title that Catflix lacks would re-pay that on every /extract. Timeouts,
+// rate limits and other failures are never cached.
+const isNoEntry = (err) => err?.status === 404 || err?.status === 502;
 async function fetchVidnestPayload(path, timeoutMs) {
   const cached = lookupCache.get(path);
-  if (cached && Date.now() - cached.at < LOOKUP_TTL_MS) return cached.value;
-  const value = await lookupVidnestPayload(path, timeoutMs);
-  lookupCache.set(path, { at: Date.now(), value });
-  return value;
+  if (cached) {
+    const ttl = cached.error ? NEGATIVE_TTL_MS : LOOKUP_TTL_MS;
+    if (Date.now() - cached.at < ttl) {
+      if (cached.error) throw cached.error;
+      return cached.value;
+    }
+  }
+  // One lookup per title at a time: a viewer retrying while the first
+  // request is still waiting on vidnest should join it, not start another.
+  let pending = inflight.get(path);
+  if (!pending) {
+    pending = lookupVidnestPayload(path, timeoutMs)
+      .then((value) => {
+        lookupCache.set(path, { at: Date.now(), value });
+        return value;
+      })
+      .catch((error) => {
+        if (isNoEntry(error)) lookupCache.set(path, { at: Date.now(), error });
+        throw error;
+      })
+      .finally(() => inflight.delete(path));
+    inflight.set(path, pending);
+  }
+  return pending;
 }
+const inflight = new Map();
 
 // Catflix: returns { url, headers } or null when the source has nothing
 // for this title.
@@ -155,14 +194,39 @@ async function lookupVidnestPayload(path, timeoutMs) {
   try {
     json = await fetchJSON(apiUrl, timeoutMs);
   } catch (directErr) {
-    if (!RELAY_PREFIX || RELAY_PREFIX === "off") throw directErr;
-    // A 404 means the title genuinely isn't there; anything else (403 from
-    // the WAF, connection reset, timeout) is worth one retry via the relay.
-    if (directErr.status === 404) throw directErr;
-    try {
-      json = await fetchJSON(`${RELAY_PREFIX}${encodeURIComponent(apiUrl)}`, timeoutMs);
-    } catch (relayErr) {
-      throw new Error(`direct: ${directErr.message}; relay: ${relayErr.message}`);
+    if (!RELAY_PREFIXES.length) throw directErr;
+    // A 404/502 means the backend genuinely has nothing for the title (and
+    // may have taken 10s+ scraping to say so); a relay would only ask it
+    // the same question. Anything else (403 from the WAF, connection reset,
+    // timeout) is worth retrying via the relays, in order. A relay that
+    // answers 404/502 has reached vidnest and got its verdict — that is
+    // final; anything else means the relay itself is broken, so move on
+    // to the next one.
+    if (isNoEntry(directErr)) throw directErr;
+    const failures = [`direct: ${directErr.message}`];
+    let verdict = null;
+    for (const prefix of RELAY_PREFIXES) {
+      try {
+        json = await fetchJSON(
+          `${prefix}${encodeURIComponent(apiUrl)}`,
+          timeoutMs,
+          RELAY_KEY ? { "X-Relay-Key": RELAY_KEY } : undefined
+        );
+        break;
+      } catch (relayErr) {
+        failures.push(`relay ${new URL(prefix).host}: ${relayErr.message}`);
+        if (isNoEntry(relayErr)) {
+          verdict = relayErr.status;
+          break;
+        }
+      }
+    }
+    if (!json) {
+      const err = new Error(failures.join("; "));
+      // Keep the verdict so callers can tell "not in catalogue" from a
+      // transient failure.
+      if (verdict) err.status = verdict;
+      throw err;
     }
   }
 

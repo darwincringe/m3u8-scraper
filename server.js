@@ -484,8 +484,9 @@ async function scrapeCatflix(type, tmdb_id, season, episode) {
       transient: streams.length === 0,
     };
   } catch (error) {
-    console.error(`[catflix] ${error.message}`);
-    return { streams: [], transient: error.status !== 404 };
+    const noEntry = error.status === 404 || error.status === 502;
+    console.error(`[catflix] ${noEntry ? `no entry for ${type} ${tmdb_id}` : error.message}`);
+    return { streams: [], transient: !noEntry };
   }
 }
 
@@ -549,6 +550,21 @@ function rankStreams(...streamLists) {
     .map((s, index) => ({ ...s, index, tier: qualityTier(s), prio: SOURCE_PRIORITY[s.source] ?? 9 }))
     .sort((a, b) => a.prio - b.prio || b.tier - a.tier || a.index - b.index)
     .map(({ index, tier, prio, ...s }) => s);
+}
+
+// Cap how long /extract waits on a secondary source (see its call site).
+// The scrape itself is not cancelled — it finishes in the background and
+// warms the vidnest lookup cache — only this response stops waiting.
+const SECONDARY_SOURCE_BUDGET_MS = parseInt(process.env.SECONDARY_SOURCE_BUDGET_MS || "4000", 10);
+function withBudget(source, scrape, budgetMs = SECONDARY_SOURCE_BUDGET_MS) {
+  let timer;
+  const expired = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      console.warn(`[extract] ${source} missed the ${budgetMs}ms budget; left out of this response`);
+      resolve({ streams: [], transient: true });
+    }, budgetMs);
+  });
+  return Promise.race([scrape, expired]).finally(() => clearTimeout(timer));
 }
 
 // Some CDN mirrors (e.g. startupscalingsystem.website) intermittently drop
@@ -865,18 +881,36 @@ app.get("/extract", async (req, res) => {
   // always gets the live state of each CDN (what's up, what quality is
   // actually reachable right now) rather than a snapshot from minutes ago.
   try {
+    // Wyzie is independent of everything below, so start it now and collect
+    // it after the sources instead of paying its ~0.8s on top of them.
+    const wyziePromise = (
+      type === "movie"
+        ? findWyzieMovieSubtitleCandidates(tmdb_id)
+        : type === "tv"
+        ? findWyzieTVSubtitleCandidates(tmdb_id, season, episode)
+        : Promise.resolve([])
+    ).catch((err) => {
+      console.error("[extract] Wyzie subtitle lookup failed:", err.message);
+      return [];
+    });
+
     // All sources are independent, so resolve them concurrently. vaplayer
     // also supplies title/imdb_id/subtitles used further down, so it always
-    // runs even when another source ends up winning.
+    // runs even when another source ends up winning. The others get a time
+    // budget: their lookups go through vidnest, whose backends scrape on
+    // demand and have been seen taking 10-20s per title, and a viewer
+    // should not wait on a mirror they may never pick. A source that misses
+    // the budget is simply left out of this response; its lookup carries on
+    // in the background and lands in the cache for the next request.
     const [result, catflix, flixhq, ophim] = await Promise.all([
       (async () => {
         const resolvedEpisode =
           type === "tv" ? await resolveTVEpisodeIndex(tmdb_id, season, episode) : episode;
         return scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode);
       })(),
-      scrapeCatflix(type, tmdb_id, season, episode),
-      scrapeFlixhq(type, tmdb_id, season, episode),
-      scrapeOphim(type, tmdb_id, season, episode),
+      withBudget("catflix", scrapeCatflix(type, tmdb_id, season, episode)),
+      withBudget("flixhq", scrapeFlixhq(type, tmdb_id, season, episode)),
+      withBudget("ophim", scrapeOphim(type, tmdb_id, season, episode)),
     ]);
 
     const streams = rankStreams(result.streams, catflix.streams, flixhq.streams, ophim.streams);
@@ -907,19 +941,10 @@ app.get("/extract", async (req, res) => {
     const host = `${req.protocol}://${req.get("host")}`;
     let subtitles = [...extractorSubs];
 
-    try {
-      const wcands =
-        type === "movie"
-          ? await findWyzieMovieSubtitleCandidates(tmdb_id)
-          : type === "tv"
-          ? await findWyzieTVSubtitleCandidates(tmdb_id, season, episode)
-          : [];
-      subtitles = subtitles.concat(
-        wcands.map(({ downloadUrl, release }) => `${downloadUrl}&release=${encodeURIComponent(release)}`)
-      );
-    } catch (err) {
-      console.error("[extract] Wyzie subtitle lookup failed:", err.message);
-    }
+    const wcands = await wyziePromise;
+    subtitles = subtitles.concat(
+      wcands.map(({ downloadUrl, release }) => `${downloadUrl}&release=${encodeURIComponent(release)}`)
+    );
 
     // The heavy scrapers (YIFY zip-validation for movies, addic7ed for TV) take
     // ~10s, so they stay a FALLBACK — only run when we STILL have nothing —

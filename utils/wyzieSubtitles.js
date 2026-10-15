@@ -26,6 +26,7 @@ const BROWSER_UA =
 // once and then reused by every other viewer and on back-navigation/rewatch
 // for the rest of the day, keeping us well under the daily limit.
 const SEARCH_TTL_MS = 1000 * 60 * 60 * 24; // 24h
+const SEARCH_TIMEOUT_MS = 6000;
 const searchCache = new Map(); // `${id}:${season}:${episode}` | `${id}:movie` -> { timestamp, candidates }
 
 // Downloads hit opensubtitles.org (not counted against the Wyzie limit), but
@@ -90,12 +91,24 @@ async function searchWyzieCandidates(id, season, episode) {
       : "") +
     `&key=${encodeURIComponent(apiKey)}`;
 
-  const res = await fetch(url, {
-    headers: { "User-Agent": BROWSER_UA, Accept: "application/json" },
-  });
-  if (!res.ok) throw new Error(`Wyzie search returned ${res.status}`);
-
-  const data = await res.json();
+  // Bounded: this runs on every /extract, so a hung Wyzie must not hold
+  // playback start hostage.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
+  let data;
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": BROWSER_UA, Accept: "application/json" },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      res.body?.destroy?.();
+      throw new Error(`Wyzie search returned ${res.status}`);
+    }
+    data = await res.json();
+  } finally {
+    clearTimeout(timeout);
+  }
   if (!Array.isArray(data)) throw new Error("Wyzie returned an unexpected payload");
 
   // Anime episodes in particular are often only available in .ass/.ssa on
