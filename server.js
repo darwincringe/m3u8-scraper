@@ -552,6 +552,76 @@ function rankStreams(...streamLists) {
     .map(({ index, tier, prio, ...s }) => s);
 }
 
+// Pull the first maxBytes of a subtitle URL so we can compare dialogue
+// without downloading a whole season pack.
+async function fetchTextHead(url, maxBytes = 2500, timeoutMs = 2500) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { "User-Agent": BROWSER_UA, Accept: "text/plain,*/*" },
+    });
+    if (!res.ok) {
+      discardBody(res);
+      return "";
+    }
+    const text = await res.text();
+    return text.slice(0, maxBytes);
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Common function words shared by unrelated English dialogue — strip them
+// so Jaccard isn't inflated past the mismatch threshold.
+const SUB_STOPWORDS = new Set(
+  `the and you your yours have has had can will for that this with are was were
+   not but his her hers they them she him don did get got all one out our just
+   like what when from know yes yeah hey how who why too any been being about
+   into over such than then there their would could should about here well
+   come going gonna right okay alright`.split(/\s+/)
+);
+
+function subtitleCueWords(srtText) {
+  return new Set(
+    String(srtText || "")
+      .replace(/\r/g, "")
+      // Drop index lines, timestamps, tags, and Wyzie's free-plan banner.
+      .replace(/^\d+\s*$/gm, "")
+      .replace(/\d{2}:\d{2}:\d{2}[^\n]*/g, "")
+      .replace(/<[^>]+>/g, "")
+      .replace(/you're on the free plan[\s\S]*?wyzie\.io/gi, "")
+      .toLowerCase()
+      .split(/[^a-z0-9']+/)
+      .filter((w) => w.length > 3 && !SUB_STOPWORDS.has(w))
+  );
+}
+
+function wordSetOverlap(a, b) {
+  if (!a.size || !b.size) return 0;
+  let inter = 0;
+  for (const w of a) if (b.has(w)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+
+// True when vaplayer's English pack and Wyzie's English pack clearly
+// describe different episodes/shows. No signal (missing either side, or
+// fetch failed) → false, so we don't demote on a flaky network.
+async function vaplayerPackMismatchesWyzie(extractorSubs, wyzieSubs) {
+  const vap = extractorSubs.find((u) => /vidapi\.cloud\/subs\/[^/]+\/English\.eng\.srt/i.test(u));
+  const wyz = wyzieSubs.find((u) => /[?&]release=ENGLISH\./i.test(u));
+  if (!vap || !wyz) return false;
+  const [a, b] = await Promise.all([fetchTextHead(vap), fetchTextHead(wyz)]);
+  if (!a || !b) return false;
+  const sim = wordSetOverlap(subtitleCueWords(a), subtitleCueWords(b));
+  // Matching packs for the same episode typically land well above 0.2;
+  // Always Sunny's wrong pack scored ~0.02 after stopword filtering.
+  return sim < 0.1;
+}
+
 // Cap how long /extract waits on a secondary source (see its call site).
 // The scrape itself is not cancelled — it finishes in the background and
 // warms the vidnest lookup cache — only this response stops waiting.
@@ -913,12 +983,55 @@ app.get("/extract", async (req, res) => {
       withBudget("ophim", scrapeOphim(type, tmdb_id, season, episode)),
     ]);
 
-    const streams = rankStreams(result.streams, catflix.streams, flixhq.streams, ophim.streams);
-    const best = streams[0] || null;
+    // Subtitles first (needed before ranking): vaplayer's bundled
+    // default_subs are frequently a pack for the *wrong* title even when
+    // file_name says SxxEyy correctly (It's Always Sunny S01E01 shipped
+    // with dialogue from another show). Wyzie is keyed by TMDB id+episode,
+    // so it wins. When both expose English, a cheap dialogue overlap check
+    // demotes vaplayer for this response if the packs clearly disagree —
+    // same signal that the video file itself is likely wrong.
+    const extractorSubs = Array.isArray(result.subtitles) ? result.subtitles : [];
+    const wcands = await wyziePromise;
+    const wyzieSubs = wcands.map(
+      ({ downloadUrl, release }) => `${downloadUrl}&release=${encodeURIComponent(release)}`
+    );
+    const vapUntrusted = await vaplayerPackMismatchesWyzie(extractorSubs, wyzieSubs);
+    if (vapUntrusted) {
+      console.warn(
+        `[extract] vaplayer subtitle pack mismatches Wyzie for ${type} ${tmdb_id}` +
+          (type === "tv" ? ` S${season}E${episode}` : "") +
+          "; demoting vaplayer"
+      );
+    }
+
+    // Wyzie first (episode-accurate). Drop vaplayer's pack entirely when
+    // untrusted; otherwise keep it after Wyzie for extra languages.
+    const host = `${req.protocol}://${req.get("host")}`;
+    let subtitles = wyzieSubs.length
+      ? vapUntrusted
+        ? [...wyzieSubs]
+        : [...wyzieSubs, ...extractorSubs]
+      : [...extractorSubs];
+
+    const vapStreams = vapUntrusted ? [] : result.streams;
+    const demotedVap = vapUntrusted ? result.streams : [];
+    const streams = [
+      ...rankStreams(vapStreams, catflix.streams, flixhq.streams, ophim.streams),
+      ...demotedVap.map((s) => ({ ...s, source: "vaplayer" })),
+    ];
+    // Deduplicate URLs if demotion somehow double-counted (shouldn't).
+    const seenUrls = new Set();
+    const uniqueStreams = streams.filter((s) => {
+      if (seenUrls.has(s.url)) return false;
+      seenUrls.add(s.url);
+      return true;
+    });
+    const best = uniqueStreams[0] || null;
     if (best) {
       console.log(
-        `[extract] ${streams.length} stream(s): ` +
-          streams.map((s) => `${s.source}@${qualityLabel(s) || "?"}`).join(", ")
+        `[extract] ${uniqueStreams.length} stream(s): ` +
+          uniqueStreams.map((s) => `${s.source}@${qualityLabel(s) || "?"}`).join(", ") +
+          (vapUntrusted ? " (vaplayer demoted)" : "")
       );
     }
 
@@ -929,22 +1042,10 @@ app.get("/extract", async (req, res) => {
     // each pointing at that source's best stream. hls_url is always
     // mirrors[0].hls_url (unless ?source= pins another one).
     const mirrors = [];
-    for (const s of streams) {
+    for (const s of uniqueStreams) {
       if (mirrors.some((m) => m.source === s.source)) continue;
       mirrors.push({ hls_url: proxied(s), source: s.source, quality: qualityLabel(s) });
     }
-
-    // Subtitles: append Wyzie ON TOP of whatever the extractor returned ("the
-    // other subtitles") — Wyzie ALWAYS runs for both movies and TV (it's a
-    // fast, cached, multi-language API), so it is never gated behind a fallback.
-    const extractorSubs = Array.isArray(result.subtitles) ? result.subtitles : [];
-    const host = `${req.protocol}://${req.get("host")}`;
-    let subtitles = [...extractorSubs];
-
-    const wcands = await wyziePromise;
-    subtitles = subtitles.concat(
-      wcands.map(({ downloadUrl, release }) => `${downloadUrl}&release=${encodeURIComponent(release)}`)
-    );
 
     // The heavy scrapers (YIFY zip-validation for movies, addic7ed for TV) take
     // ~10s, so they stay a FALLBACK — only run when we STILL have nothing —
