@@ -622,19 +622,37 @@ async function vaplayerPackMismatchesWyzie(extractorSubs, wyzieSubs) {
   return sim < 0.1;
 }
 
-// Cap how long /extract waits on a secondary source (see its call site).
-// The scrape itself is not cancelled — it finishes in the background and
-// warms the vidnest lookup cache — only this response stops waiting.
-const SECONDARY_SOURCE_BUDGET_MS = parseInt(process.env.SECONDARY_SOURCE_BUDGET_MS || "4000", 10);
-function withBudget(source, scrape, budgetMs = SECONDARY_SOURCE_BUDGET_MS) {
-  let timer;
-  const expired = new Promise((resolve) => {
-    timer = setTimeout(() => {
-      console.warn(`[extract] ${source} missed the ${budgetMs}ms budget; left out of this response`);
+// Secondary sources (vidnest) sometimes take 5–12s on a cold lookup. The
+// old hard 4s race dropped them from the response and only showed them on
+// refresh #2–3 once the cache was warm — which felt like "sources missing."
+// Soft budget is just a log line; we keep waiting for the real scrape up to
+// the hard cap so mirrors are correct on the first hit.
+const SECONDARY_SOFT_MS = parseInt(process.env.SECONDARY_SOURCE_BUDGET_MS || "4000", 10);
+const SECONDARY_HARD_MS = parseInt(process.env.SECONDARY_SOURCE_HARD_MS || "12000", 10);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function withBudget(source, scrape, softMs = SECONDARY_SOFT_MS, hardMs = SECONDARY_HARD_MS) {
+  const started = Date.now();
+  const resultPromise = Promise.resolve(scrape);
+  const soft = await Promise.race([
+    resultPromise.then((r) => ({ done: true, r })),
+    sleep(softMs).then(() => ({ done: false })),
+  ]);
+  if (soft.done) return soft.r;
+
+  console.warn(`[extract] ${source} still running after ${softMs}ms; waiting up to ${hardMs}ms`);
+  const remaining = Math.max(0, hardMs - (Date.now() - started));
+  let hardTimer;
+  const hardExpired = new Promise((resolve) => {
+    hardTimer = setTimeout(() => {
+      console.warn(`[extract] ${source} missed the ${hardMs}ms hard budget; left out of this response`);
       resolve({ streams: [], transient: true });
-    }, budgetMs);
+    }, remaining);
   });
-  return Promise.race([scrape, expired]).finally(() => clearTimeout(timer));
+  try {
+    return await Promise.race([resultPromise, hardExpired]);
+  } finally {
+    clearTimeout(hardTimer);
+  }
 }
 
 // Some CDN mirrors (e.g. startupscalingsystem.website) intermittently drop
