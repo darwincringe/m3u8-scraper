@@ -8,12 +8,11 @@ import jwt from "jsonwebtoken";
 import { col, connect, ensureIndexes } from "./db.js";
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev-insecure-change-me";
-const TOKEN_TTL = "30d";
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function signToken(u) {
-  return jwt.sign({ uid: u._id.toString(), username: u.username }, JWT_SECRET, { expiresIn: TOKEN_TTL });
+  return jwt.sign({ uid: u._id.toString(), username: u.username }, JWT_SECRET);
 }
 function publicUser(u) {
   return { id: u._id.toString(), username: u.username, email: u.email };
@@ -136,6 +135,54 @@ async function delProgress(req, res) {
   res.json({ ok: true });
 }
 
+// ---------- subtitle prefs (last-write-wins by updatedAt) ----------
+function cleanSubPref(userId, r) {
+  const mediaType = r.mediaType === "tv" ? "tv" : "movie";
+  return {
+    userId,
+    mediaType,
+    tmdbId: Number(r.tmdbId),
+    season: mediaType === "tv" ? (Number(r.season) || 0) : null,
+    name: r.name || null,
+    lang: r.lang || null,
+    off: !!r.off,
+    autoSync: r.autoSync !== false,
+    offsetMs: Number(r.offsetMs) || 0,
+    updatedAt: Number(r.updatedAt) || Date.now(),
+  };
+}
+
+async function upsertSubPref(userId, r) {
+  const doc = cleanSubPref(userId, r);
+  if (!doc.tmdbId) return { ok: false, error: "tmdbId required" };
+  const coln = await col("subtitle_prefs");
+  const filter = { userId, mediaType: doc.mediaType, tmdbId: doc.tmdbId, season: doc.season };
+  const existing = await coln.findOne(filter);
+  if (existing && existing.updatedAt > doc.updatedAt) return { ok: true, ignored: true };
+  await coln.updateOne(filter, { $set: doc }, { upsert: true });
+  return { ok: true };
+}
+
+async function getSubPrefs(req, res) {
+  const prefs = await col("subtitle_prefs");
+  const docs = await prefs.find({ userId: req.userId }).sort({ updatedAt: -1 }).toArray();
+  res.json(docs.map(stripId));
+}
+async function putSubPref(req, res) {
+  const out = await upsertSubPref(req.userId, req.body || {});
+  if (!out.ok) return res.status(400).json(out);
+  res.json(out);
+}
+async function batchSubPrefs(req, res) {
+  const records = Array.isArray(req.body && req.body.records) ? req.body.records : [];
+  let applied = 0, ignored = 0;
+  for (const r of records) {
+    const o = await upsertSubPref(req.userId, r);
+    if (o.ok) { o.ignored ? ignored++ : applied++; }
+  }
+  res.json({ applied, ignored, total: records.length });
+}
+
 // ---------- library ----------
 async function getLibrary(req, res) {
   const lib = await col("library");
@@ -148,21 +195,84 @@ async function postLibrary(req, res) {
   if (!tmdbId) return res.status(400).json({ error: "tmdbId required" });
   const mediaType = r.mediaType === "tv" ? "tv" : "movie";
   const now = Date.now();
+  const updatedAt = Number(r.updatedAt) || now;
   const lib = await col("library");
+  const filter = { userId: req.userId, mediaType, tmdbId };
+  const existing = await lib.findOne(filter);
+  if (existing && existing.updatedAt > updatedAt) return res.json({ ok: true, ignored: true });
   await lib.updateOne(
-    { userId: req.userId, mediaType, tmdbId },
+    filter,
     {
-      $set: { title: r.title || null, posterPath: r.posterPath || null },
-      $setOnInsert: { addedAt: now, lastWatchedAt: r.lastWatchedAt ? Number(r.lastWatchedAt) : now },
+      $set: {
+        title: r.title || (existing && existing.title) || null,
+        posterPath: r.posterPath || (existing && existing.posterPath) || null,
+        deleted: false,
+        updatedAt,
+        lastWatchedAt: r.lastWatchedAt ? Number(r.lastWatchedAt) : ((existing && existing.lastWatchedAt) || updatedAt),
+      },
+      $setOnInsert: { addedAt: r.addedAt ? Number(r.addedAt) : now },
     },
     { upsert: true }
   );
   res.json({ ok: true });
 }
 async function delLibrary(req, res) {
+  const mediaType = req.params.mediaType === "tv" ? "tv" : "movie";
+  const tmdbId = Number(req.params.tmdbId);
+  if (!tmdbId) return res.status(400).json({ error: "tmdbId required" });
+  const updatedAt = Number(req.query.updatedAt) || Date.now();
   const lib = await col("library");
-  await lib.deleteOne({ userId: req.userId, mediaType: req.params.mediaType, tmdbId: Number(req.params.tmdbId) });
+  const filter = { userId: req.userId, mediaType, tmdbId };
+  const existing = await lib.findOne(filter);
+  if (existing && existing.updatedAt > updatedAt) return res.json({ ok: true, ignored: true });
+  await lib.updateOne(
+    filter,
+    {
+      $set: { deleted: true, updatedAt },
+      $setOnInsert: { addedAt: updatedAt, lastWatchedAt: updatedAt },
+    },
+    { upsert: true }
+  );
   res.json({ ok: true });
+}
+
+// ---------- recommendation seeds (newest recordedAt wins per title) ----------
+function cleanSeed(userId, r) {
+  return {
+    userId,
+    mediaType: r.mediaType === "tv" ? "tv" : "movie",
+    tmdbId: Number(r.tmdbId),
+    recordedAt: Number(r.recordedAt) || Date.now(),
+  };
+}
+async function upsertSeed(userId, r) {
+  const doc = cleanSeed(userId, r);
+  if (!doc.tmdbId) return { ok: false, error: "tmdbId required" };
+  const seeds = await col("recommendation_seeds");
+  const filter = { userId, mediaType: doc.mediaType, tmdbId: doc.tmdbId };
+  const existing = await seeds.findOne(filter);
+  if (existing && existing.recordedAt > doc.recordedAt) return { ok: true, ignored: true };
+  await seeds.updateOne(filter, { $set: doc }, { upsert: true });
+  return { ok: true };
+}
+async function getSeeds(req, res) {
+  const seeds = await col("recommendation_seeds");
+  const docs = await seeds.find({ userId: req.userId }).sort({ recordedAt: -1 }).limit(30).toArray();
+  res.json(docs.map(stripId));
+}
+async function putSeed(req, res) {
+  const out = await upsertSeed(req.userId, req.body || {});
+  if (!out.ok) return res.status(400).json(out);
+  res.json(out);
+}
+async function batchSeeds(req, res) {
+  const records = Array.isArray(req.body && req.body.records) ? req.body.records : [];
+  let applied = 0, ignored = 0;
+  for (const r of records) {
+    const o = await upsertSeed(req.userId, r);
+    if (o.ok) { o.ignored ? ignored++ : applied++; }
+  }
+  res.json({ applied, ignored, total: records.length });
 }
 
 // ---------- browser test pages ----------
@@ -277,6 +387,14 @@ export function registerSyncRoutes(app) {
   app.get("/library", requireAuth, getLibrary);
   app.post("/library", requireAuth, postLibrary);
   app.delete("/library/:mediaType/:tmdbId", requireAuth, delLibrary);
+
+  app.get("/recommendations", requireAuth, getSeeds);
+  app.put("/recommendations", requireAuth, putSeed);
+  app.post("/recommendations/batch", requireAuth, batchSeeds);
+
+  app.get("/subtitle-prefs", requireAuth, getSubPrefs);
+  app.put("/subtitle-prefs", requireAuth, putSubPref);
+  app.post("/subtitle-prefs/batch", requireAuth, batchSubPrefs);
 
   app.get("/register", (req, res) => res.type("html").send(registerPage()));
   app.get("/login", (req, res) => res.type("html").send(loginPage()));
