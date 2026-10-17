@@ -44,4 +44,12 @@ export async function ensureIndexes() {
     { key: { userId: 1, mediaType: 1, tmdbId: 1 }, unique: true },
     { key: { userId: 1, lastWatchedAt: -1 } },
   ]);
+  await db.collection("subtitle_prefs").createIndexes([
+    { key: { userId: 1, mediaType: 1, tmdbId: 1, season: 1 }, unique: true },
+    { key: { userId: 1, updatedAt: -1 } },
+  ]);
+  await db.collection("recommendation_seeds").createIndexes([
+    { key: { userId: 1, mediaType: 1, tmdbId: 1 }, unique: true },
+    { key: { userId: 1, recordedAt: -1 } },
+  ]);
 }
