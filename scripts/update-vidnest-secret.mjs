@@ -4,12 +4,13 @@
  * optionally write it into utils/catflix.js.
  *
  * Usage:
- *   node scripts/update-vidnest-secret.mjs           # find + test only
- *   node scripts/update-vidnest-secret.mjs --apply   # also patch catflix.js
+ *   node scripts/update-vidnest-secret.mjs              # find + test only
+ *   node scripts/update-vidnest-secret.mjs --apply      # patch utils/catflix.js
+ *   node scripts/update-vidnest-secret.mjs --env-apply  # write VIDNEST_SECRET into .env
+ *                                                      # (preferred for cron; no git dirty)
  *
- * If decrypt still fails after --apply, set on the server and restart:
- *   VIDNEST_SECRET=<secret>   in .env
- *   pm2 restart backend --update-env
+ * Cron on prod should use --env-apply, then restart PM2 if the script prints
+ * "UPDATED .env". See readme.md.
  *
  * Optional env for the decrypt smoke-test through our relay:
  *   CATFLIX_RELAY / CATFLIX_RELAY_KEY  (same as the API server)
@@ -21,7 +22,9 @@ import { fileURLToPath } from "url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CATFLIX = path.join(ROOT, "utils", "catflix.js");
+const ENV_PATH = path.join(ROOT, ".env");
 const APPLY = process.argv.includes("--apply");
+const ENV_APPLY = process.argv.includes("--env-apply");
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const HEADERS = { "User-Agent": UA, Referer: "https://vidnest.fun/movie/550", Accept: "*/*" };
@@ -139,19 +142,33 @@ function applySecret(secret) {
   fs.writeFileSync(CATFLIX, next);
 }
 
+function applyEnvSecret(secret) {
+  let src = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, "utf8") : "";
+  if (/^VIDNEST_SECRET=/m.test(src)) {
+    src = src.replace(/^VIDNEST_SECRET=.*$/m, `VIDNEST_SECRET=${secret}`);
+  } else {
+    if (src && !src.endsWith("\n")) src += "\n";
+    src += `VIDNEST_SECRET=${secret}\n`;
+  }
+  fs.writeFileSync(ENV_PATH, src);
+}
+
 loadDotEnv();
 
-const old = currentSecretInRepo();
-console.log("repo secret:", old || "(not found)");
+const repoSecret = currentSecretInRepo();
+const envSecret = process.env.VIDNEST_SECRET || null;
+const active = envSecret || repoSecret;
+console.log("repo secret:", repoSecret || "(not found)");
+console.log("env secret: ", envSecret || "(not set)");
 
 const { secret, chunk } = await findSecretFromBundle();
 console.log("bundle secret:", secret);
 console.log("from chunk:  ", chunk);
 
-if (old === secret) {
+if (active === secret) {
   console.log("\nAlready up to date.");
 } else {
-  console.log("\nSecret differs from repo.");
+  console.log("\nSecret differs from what the server is using.");
 }
 
 const sample = await fetchEncryptedSample();
@@ -167,14 +184,22 @@ if (sample?.v !== 2 || !sample?.d) {
   }
 }
 
-if (APPLY && old !== secret) {
+if (ENV_APPLY) {
+  if (envSecret === secret) {
+    console.log("\n.env already has the current secret.");
+  } else {
+    applyEnvSecret(secret);
+    // Exact marker line — cron greps for this before restarting PM2.
+    console.log("UPDATED .env with VIDNEST_SECRET");
+  }
+} else if (APPLY && repoSecret !== secret) {
   applySecret(secret);
   console.log("\nPatched utils/catflix.js");
   console.log("Next: commit, push, then on the droplet:");
   console.log("  cd /var/www/m3u8-scraper && git pull && pm2 restart backend --update-env");
-} else if (old !== secret) {
-  console.log("\nDry run only. To write it into the repo:");
-  console.log("  node scripts/update-vidnest-secret.mjs --apply");
-  console.log("Or set without editing code:");
+} else if (active !== secret) {
+  console.log("\nDry run only. Options:");
+  console.log("  node scripts/update-vidnest-secret.mjs --env-apply   # prod / cron (writes .env)");
+  console.log("  node scripts/update-vidnest-secret.mjs --apply       # patch utils/catflix.js");
   console.log(`  VIDNEST_SECRET=${secret}`);
 }

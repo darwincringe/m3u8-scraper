@@ -1,17 +1,53 @@
 # Video Stream Extractor API
 
-A Node.js Express server that scrapes video streaming URLs (HLS `.m3u8` links) and subtitle URLs from multiple VidSrc provider domains using [Playwright](https://playwright.dev/).
+Node/Express API for `api.srctv.space`: resolves HLS streams (vaplayer, flixhq, catflix, ophim) and subtitles for movies/TV by TMDB id.
+
+---
+
+## Ops: vidnest secret rotation
+
+flixhq / catflix / ophim go through `new.vidnest.fun`. Their API answers in an encrypted v2 envelope. When they rotate the AES secret, those three sources die with decrypt / “secret rotated?” errors and **only vaplayer stays up**.
+
+### Manual fix
+
+```bash
+# Check whether the secret changed (safe, no writes)
+npm run vidnest-secret
+# or: node scripts/update-vidnest-secret.mjs
+
+# Prod-friendly: write VIDNEST_SECRET into .env (does not dirty git)
+node scripts/update-vidnest-secret.mjs --env-apply
+pm2 restart backend --update-env
+
+# Optional: also patch the default in utils/catflix.js for the repo
+npm run vidnest-secret:apply
+# then commit / push / pull on the droplet
+```
+
+### Cron on prod (every 3 days)
+
+Runs on the droplet, updates `.env` only when the bundle secret differs, then restarts PM2.
+
+```cron
+# /etc/cron.d/vidnest-secret  (or root crontab)
+0 4 */3 * * root /var/www/m3u8-scraper/scripts/cron-vidnest-secret.sh
+```
+
+Log: `/var/log/vidnest-secret.log`
+
+### Symptoms that mean “run this”
+
+- `/extract` mirrors show only `vaplayer`
+- Logs: `vidnest v2 decrypt failed … secret rotated?`
 
 ---
 
 ## Features
 
-- Scrapes multiple VidSrc domains for movie and TV stream URLs.
-- Extracts HLS video `.m3u8` URLs and subtitle files (`.vtt`, `.srt`).
-- Headless browser automation with Playwright and Chromium.
-- Takes screenshots of the stream page during scraping (saved in `/screenshots`).
-- Simple REST API with `/extract` endpoint.
-- Ready for deployment on Railway or any Docker-compatible host.
+- `/extract` with multi-source mirrors (`vaplayer`, `flixhq`, `catflix`, `ophim`) and optional `?source=`
+- HLS proxy with fMP4 / TS handling
+- Vidnest relay (Cloudflare Worker) for datacenter WAF bypass
+- Account sync (library, progress, subtitle prefs)
 
 ---
 

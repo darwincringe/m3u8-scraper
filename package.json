@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "vidnest-secret": "node scripts/update-vidnest-secret.mjs",
-    "vidnest-secret:apply": "node scripts/update-vidnest-secret.mjs --apply"
+    "vidnest-secret:apply": "node scripts/update-vidnest-secret.mjs --apply",
+    "vidnest-secret:env": "node scripts/update-vidnest-secret.mjs --env-apply"
   },
   "keywords": [],
   "author": "",
