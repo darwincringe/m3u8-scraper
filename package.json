@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "vidnest-secret": "node scripts/update-vidnest-secret.mjs",
+    "vidnest-secret:apply": "node scripts/update-vidnest-secret.mjs --apply"
   },
   "keywords": [],
   "author": "",
