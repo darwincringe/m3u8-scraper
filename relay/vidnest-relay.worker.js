@@ -22,7 +22,9 @@
 //        header X-Relay-Key: <RELAY_KEY>   (only if RELAY_KEY is set)
 // Upstream status and body are passed through unchanged.
 
-const ALLOWED_HOSTS = new Set(["new.vidnest.fun"]);
+// new.vidnest.fun = encrypted stream API; vidnest.fun = frontend/JS (needed
+// so the droplet can refresh the AES secret when Cloudflare blocks its IP).
+const ALLOWED_HOSTS = new Set(["new.vidnest.fun", "vidnest.fun"]);
 
 export default {
   async fetch(request, env) {

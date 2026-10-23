@@ -12,12 +12,15 @@ mkdir -p "$(dirname "$LOG")"
   # shellcheck disable=SC1091
   [ -f .env ] && . ./.env
   set +a
-  OUT=$(node scripts/update-vidnest-secret.mjs --env-apply 2>&1) || {
-    echo "$OUT"
-    echo "FAILED (exit $?)"
-    exit 1
-  }
+  set +e
+  OUT=$(node scripts/update-vidnest-secret.mjs --env-apply 2>&1)
+  RC=$?
+  set -e
   echo "$OUT"
+  if [ "$RC" -ne 0 ]; then
+    echo "FAILED (exit $RC)"
+    exit "$RC"
+  fi
   if echo "$OUT" | grep -q "UPDATED .env"; then
     echo "Restarting backend…"
     pm2 restart backend --update-env

@@ -47,8 +47,30 @@ function loadDotEnv() {
   }
 }
 
+function relayPrefixes() {
+  return (process.env.CATFLIX_RELAY || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s && s !== "off");
+}
+
 async function get(url) {
-  const res = await fetch(url, { headers: HEADERS });
+  let res = await fetch(url, { headers: HEADERS });
+  // Droplet IPs are WAF-blocked on vidnest.fun the same way as the API —
+  // fall through our Cloudflare Worker relay when that happens.
+  if (!res.ok && relayPrefixes().length) {
+    const key = process.env.CATFLIX_RELAY_KEY || "";
+    for (const prefix of relayPrefixes()) {
+      try {
+        res = await fetch(`${prefix}${encodeURIComponent(url)}`, {
+          headers: key ? { "X-Relay-Key": key } : {},
+        });
+        if (res.ok) break;
+      } catch {
+        /* try next */
+      }
+    }
+  }
   if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
   return res.text();
 }

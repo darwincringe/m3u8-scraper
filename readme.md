@@ -35,6 +35,8 @@ Runs on the droplet, updates `.env` only when the bundle secret differs, then re
 
 Log: `/var/log/vidnest-secret.log`
 
+The cron job loads `.env` (so `CATFLIX_RELAY` / `CATFLIX_RELAY_KEY` are set) and fetches vidnest’s JS **through the Worker relay** — the droplet’s IP is WAF-blocked on `vidnest.fun` just like on the API.
+
 ### Symptoms that mean “run this”
 
 - `/extract` mirrors show only `vaplayer`
