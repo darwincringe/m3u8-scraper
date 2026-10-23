@@ -30,7 +30,9 @@ const API_BASE = "https://new.vidnest.fun";
 // picks; the secret is a constant from their bundle (withStreamNonceUrl /
 // decryptCipherResponse in vidnest's chunk). Override with VIDNEST_SECRET
 // if they rotate it.
-const V2_SECRET = process.env.VIDNEST_SECRET || "F9k2mR8vL4qP7wY1zN0fG3bS6tH5jC8d_x4R7vN2mP9qL1";
+// Rotated on vidnest's frontend ~Oct 2026 (was F9k2mR8v…); override with
+// VIDNEST_SECRET if they rotate again.
+const V2_SECRET = process.env.VIDNEST_SECRET || "K3p8vQ2mX9rL5wZ0fN7bG1sH4tJ6dC9_y8S3wM1nQ5pL2";
 const newNonce = () => crypto.randomBytes(16).toString("base64url");
 function decryptV2(d, n) {
   const key = crypto.createHash("sha256").update(`${n}|${V2_SECRET}`).digest();
