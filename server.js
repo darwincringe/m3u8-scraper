@@ -365,20 +365,83 @@ async function getTMDBEpisodeTitle(tmdb_id, season, episode) {
 }
 
 const EPISODE_SEARCH_RADIUS = 8;
+// Dialogue overlap against Wyzie's TMDB-keyed English pack. Same-episode
+// packs land ~0.5–0.95; swapped Always Sunny S03E07/E08 scored 0.21 vs 0.95.
+const EPISODE_CONTENT_MATCH = 0.4;
+const EPISODE_CONTENT_BEST_EFFORT = 0.25;
 
-// Resolve the upstream episode index that actually matches the requested
-// season/episode (by SxxEyy tag, else TMDB title). Falls back to the
-// originally requested episode if nothing nearby matches.
+async function fetchWyzieEnglishText(tmdb_id, season, episode) {
+  const cands = await findWyzieTVSubtitleCandidates(tmdb_id, season, episode);
+  const eng = cands.find((c) => /^ENGLISH\./i.test(c.release || "")) || cands[0];
+  if (!eng?.downloadUrl) return null;
+  return fetchTextHead(eng.downloadUrl, 4000);
+}
+
+function vaplayerEnglishUrl(payload) {
+  const list = Array.isArray(payload?.default_subs) ? payload.default_subs : [];
+  const hit = list.find((s) => /English\.eng\.srt/i.test(s?.url || ""));
+  return hit?.url || null;
+}
+
+// Resolve the upstream episode *index* that carries the TMDB episode's
+// actual content. SxxEyy in a filename is not enough: some releases
+// (Always Sunny S03 Nordic WEB) tag E07/E08 swapped vs TMDB. When Wyzie
+// (keyed by TMDB) and vaplayer both expose English dialogue, we pick the
+// nearby index whose pack overlaps Wyzie. That corrected index is then
+// used for every source, since flixhq/ophim/catflix share the same drift.
 async function resolveTVEpisodeIndex(tmdb_id, season, episode) {
   const vaplayerUrl = (candidate) =>
     `https://streamdata.vaplayer.ru/api.php?tmdb=${tmdb_id}&type=tv&season=${season}&episode=${candidate}`;
 
-  // Fetch the TMDB title and the directly-indexed file together; an SxxEyy
-  // tag in the filename settles it without the title at all.
-  const [tmdbTitle, direct] = await Promise.all([
+  const [tmdbTitle, direct, wyzieText] = await Promise.all([
     getTMDBEpisodeTitle(tmdb_id, season, episode),
     fetchVaplayerJSON(vaplayerUrl(episode)).catch(() => null),
+    fetchWyzieEnglishText(tmdb_id, season, episode).catch(() => null),
   ]);
+
+  const contentScore = async (payload) => {
+    if (!wyzieText || !payload) return null;
+    const url = vaplayerEnglishUrl(payload);
+    if (!url) return null;
+    const vapText = await fetchTextHead(url, 4000);
+    if (!vapText) return null;
+    return wordSetOverlap(subtitleCueWords(wyzieText), subtitleCueWords(vapText));
+  };
+
+  const directScore = await contentScore(direct);
+  if (directScore != null) {
+    if (directScore >= EPISODE_CONTENT_MATCH) return episode;
+
+    console.warn(
+      `[episode-resolve] tmdb=${tmdb_id} S${season}E${episode}` +
+        (tmdbTitle ? ` "${tmdbTitle}"` : "") +
+        ` content mismatch (sim=${directScore.toFixed(2)}); searching nearby`
+    );
+
+    let best = { ep: episode, sim: directScore };
+    for (let offset = 1; offset <= EPISODE_SEARCH_RADIUS; offset++) {
+      const candidates = [episode + offset, episode - offset].filter((c) => c >= 1);
+      const payloads = await Promise.all(
+        candidates.map((c) => fetchVaplayerJSON(vaplayerUrl(c)).catch(() => null))
+      );
+      const scores = await Promise.all(payloads.map(contentScore));
+      for (let i = 0; i < candidates.length; i++) {
+        const sim = scores[i];
+        if (sim == null) continue;
+        if (sim > best.sim) best = { ep: candidates[i], sim };
+        if (sim >= EPISODE_CONTENT_MATCH) {
+          console.warn(`[episode-resolve] content-matched to E${candidates[i]} (sim=${sim.toFixed(2)})`);
+          return candidates[i];
+        }
+      }
+    }
+    if (best.ep !== episode && best.sim >= EPISODE_CONTENT_BEST_EFFORT) {
+      console.warn(`[episode-resolve] best-effort E${best.ep} (sim=${best.sim.toFixed(2)})`);
+      return best.ep;
+    }
+  }
+
+  // No subtitle signal: fall back to SxxEyy / TMDB title in the filename.
   if (!direct) return episode;
   const directFile = direct?.data?.file_name;
   if (!fileNameEpisodeTag(directFile) && !tmdbTitle) return episode;
@@ -388,9 +451,6 @@ async function resolveTVEpisodeIndex(tmdb_id, season, episode) {
     `[episode-resolve] tmdb=${tmdb_id} S${season}E${episode} got "${(directFile || "").split("/").pop()}", searching nearby indices`
   );
 
-  // Probe the neighbours in parallel per offset (±1, then ±2, …) so a
-  // drift of N costs N round-trips rather than 2N, and a slow upstream
-  // can't stall /extract for longer than a few timeouts.
   for (let offset = 1; offset <= EPISODE_SEARCH_RADIUS; offset++) {
     const candidates = [episode + offset, episode - offset].filter((c) => c >= 1);
     const files = await Promise.all(
@@ -398,7 +458,7 @@ async function resolveTVEpisodeIndex(tmdb_id, season, episode) {
     );
     for (let i = 0; i < candidates.length; i++) {
       if (fileMatchesEpisode(files[i], season, episode, tmdbTitle)) {
-        console.warn(`[episode-resolve] corrected to E${candidates[i]}`);
+        console.warn(`[episode-resolve] filename-matched to E${candidates[i]}`);
         return candidates[i];
       }
     }
@@ -982,6 +1042,14 @@ app.get("/extract", async (req, res) => {
       return [];
     });
 
+    // Resolve the upstream episode index against TMDB *before* scraping.
+    // Releases sometimes number episodes differently (Always Sunny S03
+    // swaps E07/E08); the corrected index is shared by every source so
+    // flixhq/ophim/catflix don't keep serving the swapped file. Wyzie
+    // above still uses the original TMDB season/episode for subtitles.
+    const resolvedEpisode =
+      type === "tv" ? await resolveTVEpisodeIndex(tmdb_id, season, episode) : episode;
+
     // All sources are independent, so resolve them concurrently. vaplayer
     // also supplies title/imdb_id/subtitles used further down, so it always
     // runs even when another source ends up winning. The others get a time
@@ -991,14 +1059,10 @@ app.get("/extract", async (req, res) => {
     // the budget is simply left out of this response; its lookup carries on
     // in the background and lands in the cache for the next request.
     const [result, catflix, flixhq, ophim] = await Promise.all([
-      (async () => {
-        const resolvedEpisode =
-          type === "tv" ? await resolveTVEpisodeIndex(tmdb_id, season, episode) : episode;
-        return scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode);
-      })(),
-      withBudget("catflix", scrapeCatflix(type, tmdb_id, season, episode)),
-      withBudget("flixhq", scrapeFlixhq(type, tmdb_id, season, episode)),
-      withBudget("ophim", scrapeOphim(type, tmdb_id, season, episode)),
+      scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode),
+      withBudget("catflix", scrapeCatflix(type, tmdb_id, season, resolvedEpisode)),
+      withBudget("flixhq", scrapeFlixhq(type, tmdb_id, season, resolvedEpisode)),
+      withBudget("ophim", scrapeOphim(type, tmdb_id, season, resolvedEpisode)),
     ]);
 
     // Subtitles first (needed before ranking): vaplayer's bundled
