@@ -698,47 +698,23 @@ async function scrapeMovy(type, tmdb_id, season, episode) {
     // City race alone often needs ~8–11s; keep headroom for seed + probe.
     const result = await fetchMovyStreams(type, tmdb_id, season, episode, meta, 18000);
     if (!result?.urls?.length) return { streams: [], subtitles: [], transient: false };
-    // Dedup by host. Prefer goldenkite/workers.dev — finalsignal often stalls
-    // 8–10s and used to burn the whole probe budget before others ran.
+    // Keep every distinct playlist URL. Cities return several workers.dev
+    // mirrors on the same host — the first is often a bare low-res media
+    // playlist, while a later `q=` is the real 1080p master (Mr Robot).
+    // Host-dedupe + "first success" was dropping those 1080p masters.
     const seenUrl = new Set();
-    const seenHost = new Set();
-    const byHost = [];
+    const unique = [];
     for (const u of result.urls) {
       if (!u || seenUrl.has(u)) continue;
       seenUrl.add(u);
-      let host = "";
-      try {
-        host = new URL(u).hostname;
-      } catch {
-        continue;
-      }
-      if (seenHost.has(host)) continue;
-      seenHost.add(host);
-      byHost.push(u);
+      // majorplay config JSON etc. aren't HLS playlists.
+      if (/\.json(\?|$)/i.test(u)) continue;
+      unique.push(u);
+      if (unique.length >= 10) break;
     }
-    const movyHostScore = (u) => {
-      try {
-        const h = new URL(u).hostname;
-        if (/goldenkite\.top$/i.test(h)) return 0;
-        if (/workers\.dev$/i.test(h)) return 1;
-        if (/finalsignal\.top$/i.test(h)) return 3;
-        return 2;
-      } catch {
-        return 9;
-      }
-    };
-    byHost.sort((a, b) => movyHostScore(a) - movyHostScore(b));
-    const unique = byHost.slice(0, 4);
-    // Probe sequentially in preference order; stop at the first reachable
-    // mirror so a hung finalsignal can't wipe Movy from the response.
-    const streams = [];
-    for (const u of unique) {
-      const hit = await probeStreamUrls([u], 5000, 1);
-      if (hit.length) {
-        streams.push(...hit);
-        break;
-      }
-    }
+    // Parallel probe with a hard per-URL timeout so a slow finalsignal
+    // mirror can't block the others; rankStreams then picks highest tier.
+    const streams = await probeStreamUrls(unique, 6000, 1);
     if (!streams.length) console.warn(`[movy] manifest unreachable for ${type} ${tmdb_id}`);
     return {
       streams: streams.map((s) => ({ ...s, source: "movy" })),
