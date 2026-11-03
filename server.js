@@ -159,12 +159,15 @@ function upstreamHeadersFor(url, cdnHint) {
     const host = u.hostname;
     const rule = UPSTREAM_HEADER_RULES.find((r) => r.test.test(host));
     if (rule) return rule.headers;
-    // Fallback heuristic when an old client URL has no &cdn= stamp: Movy
-    // paths are distinctive (`/vd/…`, `/r6/…`, `*.m4s` on rotating *.top).
+    // Fallback when an old client URL has no &cdn= stamp. Movy rotates
+    // *.top hostnames and path prefixes (/vd/, /vdb/, /r6/, /fine/, …).
     if (
       /\.top$/i.test(host) &&
-      (/^\/(vd|r6)\//i.test(u.pathname) || /\.m4s$/i.test(u.pathname))
+      (/^\/(vd|vdb|r6|fine)\b/i.test(u.pathname) || /\.(m4s|m3u8)$/i.test(u.pathname))
     ) {
+      return MOVY_UPSTREAM_HEADERS;
+    }
+    if (/\.workers\.dev$/i.test(host) && /video\.m3u8/i.test(u.pathname)) {
       return MOVY_UPSTREAM_HEADERS;
     }
   } catch {}
@@ -296,6 +299,27 @@ function qualityTier({ width, height }) {
 function qualityLabel(res) {
   const tier = qualityTier(res);
   return tier ? `${tier}p` : null;
+}
+
+// Movy city payloads label streams "2160p"/"1080p"/"Auto" even when the
+// CDN hands back a bare media playlist with no RESOLUTION tags. Map those
+// labels onto pixel dims so ranking / mirrors don't collapse to movy@null.
+function claimedQualityDims(label) {
+  const s = String(label || "").toLowerCase();
+  if (!s || s === "auto") return null;
+  if (/2160|4k|uhd/.test(s)) return { width: 3840, height: 2160, pixels: 3840 * 2160 };
+  if (/1440|2k/.test(s)) return { width: 2560, height: 1440, pixels: 2560 * 1440 };
+  if (/1080|fhd/.test(s)) return { width: 1920, height: 1080, pixels: 1920 * 1080 };
+  if (/720/.test(s)) return { width: 1280, height: 720, pixels: 1280 * 720 };
+  if (/480/.test(s)) return { width: 854, height: 480, pixels: 854 * 480 };
+  if (/360/.test(s)) return { width: 640, height: 360, pixels: 640 * 360 };
+  const m = /(\d{3,4})\s*p/.exec(s);
+  if (m) {
+    const height = parseInt(m[1], 10);
+    const width = Math.round((height * 16) / 9);
+    return { width, height, pixels: width * height };
+  }
+  return null;
 }
 
 // The CDN mirrors upstream sources hand out are short-lived and
@@ -697,27 +721,28 @@ async function scrapeMovy(type, tmdb_id, season, episode) {
     if (!meta?.title) return { streams: [], subtitles: [], transient: false };
     // City race alone often needs ~8–11s; keep headroom for seed + probe.
     const result = await fetchMovyStreams(type, tmdb_id, season, episode, meta, 18000);
-    if (!result?.urls?.length) return { streams: [], subtitles: [], transient: false };
-    // Keep every distinct playlist URL. Cities return several workers.dev
-    // mirrors on the same host — the first is often a bare low-res media
-    // playlist, while a later `q=` is the real 1080p master (Mr Robot).
-    // Host-dedupe + "first success" was dropping those 1080p masters.
-    const seenUrl = new Set();
-    const unique = [];
-    for (const u of result.urls) {
-      if (!u || seenUrl.has(u)) continue;
-      seenUrl.add(u);
-      // majorplay config JSON etc. aren't HLS playlists.
-      if (/\.json(\?|$)/i.test(u)) continue;
-      unique.push(u);
-      if (unique.length >= 10) break;
-    }
-    // Parallel probe with a hard per-URL timeout so a slow finalsignal
-    // mirror can't block the others; rankStreams then picks highest tier.
-    const streams = await probeStreamUrls(unique, 6000, 1);
+    const candidates = (result?.streams || [])
+      .filter((s) => s?.url && !/\.json(\?|$)/i.test(s.url))
+      .slice(0, 12);
+    if (!candidates.length) return { streams: [], subtitles: [], transient: false };
+
+    // Probe reachability in parallel. Prefer probe-measured RESOLUTION when
+    // present; otherwise keep Movy's claimed label (2160p/1080p/…) so bare
+    // media playlists from goldenkite still rank and show in mirrors.
+    const claimedByUrl = new Map(candidates.map((s) => [s.url, s.quality]));
+    const probed = await probeStreamUrls(
+      candidates.map((s) => s.url),
+      6000,
+      1
+    );
+    const streams = probed.map((s) => {
+      if (s.width || s.height) return { ...s, source: "movy" };
+      const claimed = claimedQualityDims(claimedByUrl.get(s.url));
+      return claimed ? { ...s, ...claimed, source: "movy" } : { ...s, source: "movy" };
+    });
     if (!streams.length) console.warn(`[movy] manifest unreachable for ${type} ${tmdb_id}`);
     return {
-      streams: streams.map((s) => ({ ...s, source: "movy" })),
+      streams,
       subtitles: [],
       transient: streams.length === 0,
     };

@@ -132,6 +132,11 @@ async function fetchSeed(mediaId, timeoutMs) {
   }
 }
 
+function sourceQualityLabel(s) {
+  const raw = s?.quality ?? s?.label ?? s?.resolution ?? s?.height ?? "";
+  return String(raw || "").trim();
+}
+
 async function fetchCitySources(city, params, mediaId, seed, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -152,19 +157,29 @@ async function fetchCitySources(city, params, mediaId, seed, timeoutMs) {
     const payload = text.trim().startsWith('"') ? JSON.parse(text.trim()) : text.trim();
     const json = JSON.parse(decryptWecollegePayload(payload, seed, mediaId));
     const sources = Array.isArray(json?.sources) ? json.sources : [];
-    const urls = sources
-      .map((s) => (typeof s?.url === "string" ? s.url.trim() : ""))
-      .filter((u) => /^https?:\/\//i.test(u));
-    return { city, urls, raw: sources, subtitles: Array.isArray(json?.subtitles) ? json.subtitles : [] };
+    const streams = sources
+      .map((s) => {
+        const u = typeof s?.url === "string" ? s.url.trim() : "";
+        if (!/^https?:\/\//i.test(u)) return null;
+        return { url: u, quality: sourceQualityLabel(s), city };
+      })
+      .filter(Boolean);
+    return {
+      city,
+      streams,
+      subtitles: Array.isArray(json?.subtitles) ? json.subtitles : [],
+    };
   } finally {
     clearTimeout(timer);
   }
 }
 
 /**
- * Race Movy's English city extractors. Returns { urls, subtitles } or null.
- * `meta` needs { title, year, imdbId, totalSeasons } — title is double-encoded
- * the same way Movy's frontend does (encodeURIComponent then query encoder).
+ * Race Movy's English city extractors.
+ * Returns { streams: [{url, quality, city}], urls, subtitles } or null.
+ * `quality` is Movy's own label (often "2160p"/"1080p") — their CDNs frequently
+ * serve bare media playlists with no RESOLUTION tags, so callers must keep it.
+ * `meta` needs { title, year, imdbId, totalSeasons }.
  */
 export async function fetchMovyStreams(type, tmdb_id, season, episode, meta, timeoutMs = 8000) {
   if (!meta?.title || !tmdb_id) return null;
@@ -197,20 +212,38 @@ export async function fetchMovyStreams(type, tmdb_id, season, episode, meta, tim
     )
   );
 
-  const urls = [];
+  const streams = [];
   const seen = new Set();
   const subtitles = [];
   for (const r of results) {
     if (!r) continue;
-    for (const u of r.urls) {
-      if (seen.has(u)) continue;
-      seen.add(u);
-      urls.push(u);
+    for (const s of r.streams) {
+      if (seen.has(s.url)) continue;
+      seen.add(s.url);
+      streams.push(s);
     }
-    for (const s of r.subtitles) {
-      const u = typeof s === "string" ? s : s?.url;
+    for (const sub of r.subtitles) {
+      const u = typeof sub === "string" ? sub : sub?.url;
       if (u && /^https?:\/\//i.test(u)) subtitles.push(u);
     }
   }
-  return urls.length ? { urls, subtitles } : null;
+  if (!streams.length) return null;
+  // Highest claimed quality first so probes / ranking see 2160p before "Auto".
+  const rank = (q) => {
+    const s = String(q || "").toLowerCase();
+    if (/2160|4k|uhd/.test(s)) return 2160;
+    if (/1440|2k/.test(s)) return 1440;
+    if (/1080|fhd/.test(s)) return 1080;
+    if (/720/.test(s)) return 720;
+    if (/480/.test(s)) return 480;
+    if (/360/.test(s)) return 360;
+    return 0;
+  };
+  streams.sort((a, b) => rank(b.quality) - rank(a.quality));
+  return {
+    streams,
+    // Back-compat for anything still reading `.urls`.
+    urls: streams.map((s) => s.url),
+    subtitles,
+  };
 }
