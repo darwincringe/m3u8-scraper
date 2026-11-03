@@ -186,7 +186,7 @@ function normalizeFlixhqSubtitles(raw) {
 
 // flixhq: returns { urls, subtitles } or null when the source has nothing
 // for this title. The payload is {status, url, quality: "auto", subtitles}.
-export async function fetchFlixhqStreams(type, tmdb_id, season, episode, timeoutMs = 8000) {
+export async function fetchFlixhqStreams(type, tmdb_id, season, episode, timeoutMs = 15000) {
   const payload = await fetchVidnestPayload(titlePath("flixhq", type, tmdb_id, season, episode), timeoutMs);
   const url = typeof payload?.url === "string" ? payload.url.trim() : "";
   if (!/^https?:\/\//i.test(url)) return null;
@@ -197,7 +197,7 @@ export async function fetchFlixhqStreams(type, tmdb_id, season, episode, timeout
 // payload is {streams: [{language, quality, type, url}]}, one master per
 // audio language; dubs are skipped unless nothing else is offered. ophim
 // does not ship subtitle tracks.
-export async function fetchOphimStreams(type, tmdb_id, season, episode, timeoutMs = 8000) {
+export async function fetchOphimStreams(type, tmdb_id, season, episode, timeoutMs = 15000) {
   const payload = await fetchVidnestPayload(titlePath("ophim", type, tmdb_id, season, episode), timeoutMs);
   const list = (Array.isArray(payload?.streams) ? payload.streams : [])
     .filter((s) => typeof s?.url === "string" && /^https?:\/\//i.test(s.url.trim()))

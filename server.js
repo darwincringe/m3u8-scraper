@@ -770,6 +770,7 @@ const SOURCE_PRIORITY = { vaplayer: 0, movy: 1, flixhq: 2, catflix: 3, ophim: 4 
 // says so instead of silently handing back another source.
 function applySourceFilter(response, source) {
   if (!source || !response.success) return response;
+  // mirrors are quality-ranked; first match is that source's best tier.
   const pick = response.mirrors.find((m) => m.source === source);
   if (!pick) {
     return {
@@ -1268,38 +1269,50 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
       flixhq = { streams: [], subtitles: [] };
       ophim = { streams: [], subtitles: [] };
     } else {
-      // Movy keys by TMDB S/E (not vaplayer's index), so kick it off while
-      // episode-resolve runs — otherwise resolve's nearby search (~3–8s)
-      // + Movy's city race (~10s) + probe routinely miss the hard budget.
+      // Movy / flixhq / ophim / catflix all key by TMDB S/E (not vaplayer's
+      // remapped index), so start them with the *original* episode while
+      // episode-resolve runs. That stops Movy's long city+probe from pushing
+      // flixhq/ophim past their budget (they were vanishing from mirrors).
+      const secondaryHardMs = 20000;
       const movyPromise = withBudget(
         "movy",
         scrapeMovy(type, tmdb_id, season, episode),
         SECONDARY_SOFT_MS,
-        20000
+        secondaryHardMs
+      );
+      const flixhqPromise = withBudget(
+        "flixhq",
+        scrapeFlixhq(type, tmdb_id, season, episode),
+        SECONDARY_SOFT_MS,
+        secondaryHardMs
+      );
+      const ophimPromise = withBudget(
+        "ophim",
+        scrapeOphim(type, tmdb_id, season, episode),
+        SECONDARY_SOFT_MS,
+        secondaryHardMs
+      );
+      const catflixPromise = withBudget(
+        "catflix",
+        scrapeCatflix(type, tmdb_id, season, episode),
+        SECONDARY_SOFT_MS,
+        secondaryHardMs
       );
 
-      // Resolve the upstream episode index against TMDB *before* scraping
-      // vaplayer/vidnest. Some releases tag SxxEyy wrong; we match English
-      // dialogue against the TMDB title/overview (not Wyzie). Wyzie subtitle
-      // lookup above still uses the original TMDB S/E.
+      // Resolve the upstream episode index against TMDB for vaplayer only.
+      // Some releases tag SxxEyy wrong; we match English dialogue against the
+      // TMDB title/overview (not Wyzie). Wyzie subtitle lookup above still
+      // uses the original TMDB S/E.
       const tmdbMetaPromise =
         type === "tv" ? getTMDBEpisodeMeta(tmdb_id, season, episode).catch(() => null) : Promise.resolve(null);
       const resolvedEpisode =
         type === "tv" ? await resolveTVEpisodeIndex(tmdb_id, season, episode) : episode;
 
-      // All sources are independent, so resolve them concurrently. vaplayer
-      // also supplies title/imdb_id/subtitles used further down, so it always
-      // runs even when another source ends up winning. The others get a time
-      // budget: their lookups go through vidnest, whose backends scrape on
-      // demand and have been seen taking 10-20s per title, and a viewer
-      // should not wait on a mirror they may never pick. A source that misses
-      // the budget is simply left out of this response; its lookup carries on
-      // in the background and lands in the cache for the next request.
       [result, catflix, flixhq, ophim, movy, tmdbMeta] = await Promise.all([
         scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode),
-        withBudget("catflix", scrapeCatflix(type, tmdb_id, season, resolvedEpisode)),
-        withBudget("flixhq", scrapeFlixhq(type, tmdb_id, season, resolvedEpisode)),
-        withBudget("ophim", scrapeOphim(type, tmdb_id, season, resolvedEpisode)),
+        catflixPromise,
+        flixhqPromise,
+        ophimPromise,
         movyPromise,
         tmdbMetaPromise,
       ]);
@@ -1368,13 +1381,14 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
       return `${origin}/hls-proxy?url=${encodeURIComponent(s.url)}${cdn}`;
     };
     const proxiedHlsUrl = best ? proxied(best) : null;
-    // One entry per source that has a working stream, in priority order,
-    // each pointing at that source's best stream. hls_url is always
-    // mirrors[0].hls_url (unless ?source= pins another one).
+    // One entry per source+quality (so Movy can expose 2160p/1080p/720p/480p
+    // side by side). Ordered by rankStreams (highest quality first). hls_url
+    // is always mirrors[0] unless ?source= pins another source.
     const mirrors = [];
     for (const s of uniqueStreams) {
-      if (mirrors.some((m) => m.source === s.source)) continue;
-      mirrors.push({ hls_url: proxied(s), source: s.source, quality: qualityLabel(s) });
+      const quality = qualityLabel(s);
+      if (mirrors.some((m) => m.source === s.source && m.quality === quality)) continue;
+      mirrors.push({ hls_url: proxied(s), source: s.source, quality });
     }
 
     // The heavy scrapers (YIFY zip-validation for movies, addic7ed for TV) take
