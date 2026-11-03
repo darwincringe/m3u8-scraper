@@ -168,18 +168,35 @@ export async function fetchCatflixStream(type, tmdb_id, season, episode, timeout
   return { url, headers: payload.headers || {} };
 }
 
-// flixhq: returns [masterUrl] or null when the source has nothing for this
-// title. The payload is {status: "success", url, quality: "auto"}.
+// Normalize flixhq's {lang, url} (or bare URL) tracks into proxy-ready
+// absolute URLs with a `release=flixhq.<lang>` label so the player can
+// tell them apart from Wyzie / vaplayer entries.
+function normalizeFlixhqSubtitles(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const s of raw) {
+    const url = typeof s === "string" ? s.trim() : typeof s?.url === "string" ? s.url.trim() : "";
+    if (!/^https?:\/\//i.test(url)) continue;
+    const lang = (typeof s === "object" && s?.lang ? String(s.lang) : "und").toLowerCase();
+    const sep = url.includes("?") ? "&" : "?";
+    out.push(`${url}${sep}release=${encodeURIComponent(`flixhq.${lang}`)}`);
+  }
+  return out;
+}
+
+// flixhq: returns { urls, subtitles } or null when the source has nothing
+// for this title. The payload is {status, url, quality: "auto", subtitles}.
 export async function fetchFlixhqStreams(type, tmdb_id, season, episode, timeoutMs = 8000) {
   const payload = await fetchVidnestPayload(titlePath("flixhq", type, tmdb_id, season, episode), timeoutMs);
   const url = typeof payload?.url === "string" ? payload.url.trim() : "";
   if (!/^https?:\/\//i.test(url)) return null;
-  return [url];
+  return { urls: [url], subtitles: normalizeFlixhqSubtitles(payload.subtitles) };
 }
 
-// ophim: returns [masterUrl, ...] (original-language first) or null. The
+// ophim: returns { urls, subtitles } (original-language first) or null. The
 // payload is {streams: [{language, quality, type, url}]}, one master per
-// audio language; dubs are skipped unless nothing else is offered.
+// audio language; dubs are skipped unless nothing else is offered. ophim
+// does not ship subtitle tracks.
 export async function fetchOphimStreams(type, tmdb_id, season, episode, timeoutMs = 8000) {
   const payload = await fetchVidnestPayload(titlePath("ophim", type, tmdb_id, season, episode), timeoutMs);
   const list = (Array.isArray(payload?.streams) ? payload.streams : [])
@@ -187,7 +204,7 @@ export async function fetchOphimStreams(type, tmdb_id, season, episode, timeoutM
     .filter((s) => !s.type || /hls|m3u8/i.test(s.type));
   const original = list.filter((s) => /original|multi/i.test(s.language || ""));
   const chosen = original.length ? original : list;
-  return chosen.length ? chosen.map((s) => s.url.trim()) : null;
+  return chosen.length ? { urls: chosen.map((s) => s.url.trim()), subtitles: [] } : null;
 }
 
 async function lookupVidnestPayload(path, timeoutMs) {

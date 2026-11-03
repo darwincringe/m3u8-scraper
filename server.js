@@ -18,12 +18,14 @@ import {
   findWyzieMovieSubtitleCandidates,
   downloadWyzieSubtitleSRT,
 } from "./utils/wyzieSubtitles.js";
-import { registerSyncRoutes } from "./srctvSync.js";
+import { registerSyncRoutes, requireAuth, requirePremium } from "./srctvSync.js";
 import { fetchCatflixStream, fetchFlixhqStreams, fetchOphimStreams } from "./utils/catflix.js";
+import { fetchMovyStreams } from "./utils/wecollege.js";
 import { Readable } from "stream";
 import { readFileSync } from "fs";
 import http from "http";
 import https from "https";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 dotenv.config();
 
 const app = express();
@@ -42,8 +44,32 @@ export const headers = {
 };
 
 app.use(cors());
-app.use(json());
+app.use(json({ limit: "64kb" }));
+
+// Surge / cost protection: cap noisy clients before they reach scrapers.
+// /hls-proxy is intentionally looser (many segment requests per viewer).
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please slow down" },
+  skip: (req) => req.path === "/hls-proxy",
+});
+const extractLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Extract rate limit exceeded" },
+  keyGenerator: (req, res) => (req.userId ? `u:${req.userId}` : ipKeyGenerator(req, res)),
+});
+app.use(globalLimiter);
+
 registerSyncRoutes(app);
+
+// Expensive scrape/subtitle routes: Bearer + active premium (admin does not bypass).
+const requirePremiumAccess = [requireAuth, requirePremium];
 
 export const LANGUAGE_NAMES = {
   en: "English",
@@ -67,6 +93,19 @@ const UPSTREAM_HEADER_RULES = [
     },
   },
 ];
+// Movy / wecollege CDNs hard-403 without the movy.sx Referer. Hostnames
+// rotate (finalsignal, goldenkite, pulseatom, …); known hosts + path heuristic
+// in upstreamHeadersFor cover the churn.
+const MOVY_UPSTREAM_HEADERS = {
+  Referer: "https://www.movy.sx/",
+  Origin: "https://www.movy.sx",
+  "User-Agent": BROWSER_UA,
+  Accept: "application/vnd.apple.mpegurl,application/x-mpegURL,*/*",
+};
+UPSTREAM_HEADER_RULES.push({
+  test: /(^|\.)(finalsignal\.top|goldenkite\.top|pulseatom\.top|wellsrobertsonkmlt\.workers\.dev)$/i,
+  headers: MOVY_UPSTREAM_HEADERS,
+});
 // Everything else — vaplayer mirrors and the Cloudflare Workers fronting
 // flixhq/ophim — gets vaplayer's Referer plus a browser User-Agent (some
 // CDNs 403 node-fetch's default UA; none of ours mind a browser one).
@@ -86,11 +125,13 @@ const upstreamAgents = {
 };
 const upstreamAgent = (url) => upstreamAgents[url.protocol] || upstreamAgents["https:"];
 
-// Fetch an upstream URL with the right per-host headers and the shared agent.
+// Fetch an upstream URL with the right per-host / per-cdn headers and the
+// shared agent. `cdnHint` (e.g. "movy") wins over host heuristics.
 function fetchUpstream(url, init = {}) {
+  const { cdnHint, headers: extraHeaders, ...rest } = init;
   return fetch(url, {
-    ...init,
-    headers: { ...upstreamHeadersFor(url), ...(init.headers || {}) },
+    ...rest,
+    headers: { ...upstreamHeadersFor(url, cdnHint), ...(extraHeaders || {}) },
     agent: upstreamAgent,
   });
 }
@@ -103,11 +144,29 @@ function discardBody(res) {
   } catch {}
 }
 
-function upstreamHeadersFor(url) {
+// Per-source CDN hints stamped on /hls-proxy URLs by /extract (`&cdn=movy`).
+// Movy rotates hostnames constantly; the hint — not a host allowlist — is
+// what permanently picks the right Referer for every playlist/segment hop.
+const CDN_HINT_HEADERS = {
+  movy: MOVY_UPSTREAM_HEADERS,
+  catflix: UPSTREAM_HEADER_RULES[0].headers,
+};
+
+function upstreamHeadersFor(url, cdnHint) {
+  if (cdnHint && CDN_HINT_HEADERS[cdnHint]) return CDN_HINT_HEADERS[cdnHint];
   try {
-    const host = new URL(url).hostname;
+    const u = new URL(url);
+    const host = u.hostname;
     const rule = UPSTREAM_HEADER_RULES.find((r) => r.test.test(host));
     if (rule) return rule.headers;
+    // Fallback heuristic when an old client URL has no &cdn= stamp: Movy
+    // paths are distinctive (`/vd/…`, `/r6/…`, `*.m4s` on rotating *.top).
+    if (
+      /\.top$/i.test(host) &&
+      (/^\/(vd|r6)\//i.test(u.pathname) || /\.m4s$/i.test(u.pathname))
+    ) {
+      return MOVY_UPSTREAM_HEADERS;
+    }
   } catch {}
   return DEFAULT_UPSTREAM_HEADERS;
 }
@@ -351,31 +410,29 @@ function fileMatchesEpisode(fileName, season, episode, tmdbTitle) {
   return fileNameMatchesTitle(fileName, tmdbTitle);
 }
 
-async function getTMDBEpisodeTitle(tmdb_id, season, episode) {
+async function getTMDBEpisodeMeta(tmdb_id, season, episode) {
   if (!TMDB_API_KEY) return null;
   try {
     const url = `https://api.themoviedb.org/3/tv/${tmdb_id}/season/${season}/episode/${episode}?api_key=${TMDB_API_KEY}`;
     const res = await fetch(url);
     if (!res.ok) return null;
     const json = await res.json();
-    return json?.name || null;
+    return {
+      name: json?.name || null,
+      overview: json?.overview || null,
+    };
   } catch {
     return null;
   }
 }
 
 const EPISODE_SEARCH_RADIUS = 8;
-// Dialogue overlap against Wyzie's TMDB-keyed English pack. Same-episode
-// packs land ~0.5–0.95; swapped Always Sunny S03E07/E08 scored 0.21 vs 0.95.
-const EPISODE_CONTENT_MATCH = 0.4;
-const EPISODE_CONTENT_BEST_EFFORT = 0.25;
-
-async function fetchWyzieEnglishText(tmdb_id, season, episode) {
-  const cands = await findWyzieTVSubtitleCandidates(tmdb_id, season, episode);
-  const eng = cands.find((c) => /^ENGLISH\./i.test(c.release || "")) || cands[0];
-  if (!eng?.downloadUrl) return null;
-  return fetchTextHead(eng.downloadUrl, 4000);
-}
+// Fraction of TMDB title/overview content-words that must appear in a
+// candidate's English sub. Overview text is short, so we use coverage
+// (not Jaccard vs the whole SRT). Real matches for Always Sunny S04 land
+// ~0.5–0.8; wrong neighbors stay under ~0.25.
+const EPISODE_TMDB_MATCH = 0.4;
+const EPISODE_TMDB_BEST_EFFORT = 0.28;
 
 function vaplayerEnglishUrl(payload) {
   const list = Array.isArray(payload?.default_subs) ? payload.default_subs : [];
@@ -383,39 +440,52 @@ function vaplayerEnglishUrl(payload) {
   return hit?.url || null;
 }
 
+function tmdbEpisodeRefWords(meta) {
+  if (!meta) return new Set();
+  return subtitleCueWords(`${meta.name || ""}. ${meta.overview || ""}`);
+}
+
+function refCoverage(refWords, candWords) {
+  if (!refWords.size || !candWords.size) return 0;
+  let hit = 0;
+  for (const w of refWords) if (candWords.has(w)) hit++;
+  return hit / refWords.size;
+}
+
 // Resolve the upstream episode *index* that carries the TMDB episode's
-// actual content. SxxEyy in a filename is not enough: some releases
-// (Always Sunny S03 Nordic WEB) tag E07/E08 swapped vs TMDB. When Wyzie
-// (keyed by TMDB) and vaplayer both expose English dialogue, we pick the
-// nearby index whose pack overlaps Wyzie. That corrected index is then
-// used for every source, since flixhq/ophim/catflix share the same drift.
+// actual content. Ground truth is TMDB title+overview — NOT Wyzie. Wyzie
+// is often itself mis-indexed (Always Sunny S04E05 Wyzie pack is actually
+// E07 "Who Pooped the Bed?"), and trusting it remapped us onto the wrong
+// file while Movy/vaplayer E5 were correct. The corrected index is shared
+// by every source (vaplayer/flixhq/movy/…) so they stay in sync.
 async function resolveTVEpisodeIndex(tmdb_id, season, episode) {
   const vaplayerUrl = (candidate) =>
     `https://streamdata.vaplayer.ru/api.php?tmdb=${tmdb_id}&type=tv&season=${season}&episode=${candidate}`;
 
-  const [tmdbTitle, direct, wyzieText] = await Promise.all([
-    getTMDBEpisodeTitle(tmdb_id, season, episode),
+  const [tmdbMeta, direct] = await Promise.all([
+    getTMDBEpisodeMeta(tmdb_id, season, episode),
     fetchVaplayerJSON(vaplayerUrl(episode)).catch(() => null),
-    fetchWyzieEnglishText(tmdb_id, season, episode).catch(() => null),
   ]);
+  const tmdbTitle = tmdbMeta?.name || null;
+  const refWords = tmdbEpisodeRefWords(tmdbMeta);
 
   const contentScore = async (payload) => {
-    if (!wyzieText || !payload) return null;
+    if (refWords.size < 3 || !payload) return null;
     const url = vaplayerEnglishUrl(payload);
     if (!url) return null;
-    const vapText = await fetchTextHead(url, 4000);
+    const vapText = await fetchTextHead(url, 5000);
     if (!vapText) return null;
-    return wordSetOverlap(subtitleCueWords(wyzieText), subtitleCueWords(vapText));
+    return refCoverage(refWords, subtitleCueWords(vapText));
   };
 
   const directScore = await contentScore(direct);
   if (directScore != null) {
-    if (directScore >= EPISODE_CONTENT_MATCH) return episode;
+    if (directScore >= EPISODE_TMDB_MATCH) return episode;
 
     console.warn(
       `[episode-resolve] tmdb=${tmdb_id} S${season}E${episode}` +
         (tmdbTitle ? ` "${tmdbTitle}"` : "") +
-        ` content mismatch (sim=${directScore.toFixed(2)}); searching nearby`
+        ` TMDB coverage=${directScore.toFixed(2)}; searching nearby`
     );
 
     let best = { ep: episode, sim: directScore };
@@ -429,16 +499,20 @@ async function resolveTVEpisodeIndex(tmdb_id, season, episode) {
         const sim = scores[i];
         if (sim == null) continue;
         if (sim > best.sim) best = { ep: candidates[i], sim };
-        if (sim >= EPISODE_CONTENT_MATCH) {
-          console.warn(`[episode-resolve] content-matched to E${candidates[i]} (sim=${sim.toFixed(2)})`);
+        if (sim >= EPISODE_TMDB_MATCH) {
+          console.warn(`[episode-resolve] TMDB-matched to E${candidates[i]} (cov=${sim.toFixed(2)})`);
           return candidates[i];
         }
       }
     }
-    if (best.ep !== episode && best.sim >= EPISODE_CONTENT_BEST_EFFORT) {
-      console.warn(`[episode-resolve] best-effort E${best.ep} (sim=${best.sim.toFixed(2)})`);
+    if (best.ep !== episode && best.sim >= EPISODE_TMDB_BEST_EFFORT) {
+      console.warn(`[episode-resolve] best-effort E${best.ep} (cov=${best.sim.toFixed(2)})`);
       return best.ep;
     }
+    // Direct pack is weak against TMDB but nothing nearby is better — keep
+    // the requested index (Movy/filename often still right; don't chase
+    // Wyzie-shaped ghosts).
+    return episode;
   }
 
   // No subtitle signal: fall back to SxxEyy / TMDB title in the filename.
@@ -536,17 +610,18 @@ async function scrapeVaplayerAPI(type, tmdb_id, season, episode) {
 async function scrapeCatflix(type, tmdb_id, season, episode) {
   try {
     const stream = await fetchCatflixStream(type, tmdb_id, season, episode);
-    if (!stream) return { streams: [], transient: false };
+    if (!stream) return { streams: [], subtitles: [], transient: false };
     const streams = await probeStreamUrls([stream.url], PROBE_TIMEOUT_MS, PROBE_ATTEMPTS);
     if (!streams.length) console.warn(`[catflix] manifest unreachable: ${stream.url.slice(0, 80)}…`);
     return {
       streams: streams.map((s) => ({ ...s, source: "catflix" })),
+      subtitles: [],
       transient: streams.length === 0,
     };
   } catch (error) {
     const noEntry = error.status === 404 || error.status === 502;
     console.error(`[catflix] ${noEntry ? `no entry for ${type} ${tmdb_id}` : error.message}`);
-    return { streams: [], transient: !noEntry };
+    return { streams: [], subtitles: [], transient: !noEntry };
   }
 }
 
@@ -555,23 +630,126 @@ async function scrapeCatflix(type, tmdb_id, season, episode) {
 // same master-aware probe as everything else. Same contract as
 // scrapeCatflix: never throws; `transient` means the source *had* a URL
 // (or the API errored) but nothing could be confirmed right now.
+// `fetchMasters` returns { urls, subtitles } (or a bare url list for
+// older callers); source-bundled subtitle tracks are passed through so
+// /extract can append them under Wyzie.
 async function scrapeVidnestMasters(source, fetchMasters, type, tmdb_id, season, episode) {
   try {
-    const masters = await fetchMasters(type, tmdb_id, season, episode);
-    if (!masters) return { streams: [], transient: false };
+    const result = await fetchMasters(type, tmdb_id, season, episode);
+    if (!result) return { streams: [], subtitles: [], transient: false };
+    const masters = Array.isArray(result) ? result : result.urls;
+    const subtitles = Array.isArray(result) ? [] : Array.isArray(result.subtitles) ? result.subtitles : [];
+    if (!masters?.length) return { streams: [], subtitles, transient: false };
     const streams = await probeStreamUrls(masters, PROBE_TIMEOUT_MS, PROBE_ATTEMPTS);
     if (!streams.length) console.warn(`[${source}] manifest unreachable for ${type} ${tmdb_id}`);
-    return { streams: streams.map((s) => ({ ...s, source })), transient: streams.length === 0 };
+    return {
+      streams: streams.map((s) => ({ ...s, source })),
+      subtitles,
+      transient: streams.length === 0,
+    };
   } catch (error) {
     // vidnest answers 502 for "no entry" and 404 for unknown routes; both
     // are definitive, not transient.
     const noEntry = error.status === 404 || error.status === 502;
     console.error(`[${source}] ${noEntry ? `no entry for ${type} ${tmdb_id}` : error.message}`);
-    return { streams: [], transient: !noEntry };
+    return { streams: [], subtitles: [], transient: !noEntry };
   }
 }
 const scrapeFlixhq = (...a) => scrapeVidnestMasters("flixhq", fetchFlixhqStreams, ...a);
 const scrapeOphim = (...a) => scrapeVidnestMasters("ophim", fetchOphimStreams, ...a);
+
+// TMDB metadata Movy's extractors want (title/year/imdb/seasons). Cached
+// briefly so a burst of /extract calls doesn't burn the key.
+const movyMetaCache = new Map();
+async function fetchMovyMeta(type, tmdb_id) {
+  const key = `${type}:${tmdb_id}`;
+  const hit = movyMetaCache.get(key);
+  if (hit && Date.now() - hit.at < 6 * 60 * 60 * 1000) return hit.meta;
+  if (!TMDB_API_KEY) return null;
+  try {
+    const path = type === "tv" ? `tv/${tmdb_id}` : `movie/${tmdb_id}`;
+    const url =
+      `https://api.themoviedb.org/3/${path}?api_key=${TMDB_API_KEY}` +
+      `&append_to_response=external_ids`;
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return null;
+    const j = await res.json();
+    const meta = {
+      title: type === "tv" ? j.name || j.original_name : j.title || j.original_title,
+      year: Number(
+        String(type === "tv" ? j.first_air_date : j.release_date || "").slice(0, 4)
+      ) || undefined,
+      imdbId: j.external_ids?.imdb_id || j.imdb_id || undefined,
+      totalSeasons: type === "tv" ? j.number_of_seasons || undefined : undefined,
+    };
+    if (!meta.title) return null;
+    movyMetaCache.set(key, { at: Date.now(), meta });
+    return meta;
+  } catch {
+    return null;
+  }
+}
+
+async function scrapeMovy(type, tmdb_id, season, episode) {
+  try {
+    let meta = await fetchMovyMeta(type, tmdb_id);
+    // Fall back to vaplayer's title/imdb when TMDB is down — enough for most cities.
+    if (!meta?.title) return { streams: [], subtitles: [], transient: false };
+    // City race alone often needs ~8–11s; keep headroom for seed + probe.
+    const result = await fetchMovyStreams(type, tmdb_id, season, episode, meta, 18000);
+    if (!result?.urls?.length) return { streams: [], subtitles: [], transient: false };
+    // Dedup by host. Prefer goldenkite/workers.dev — finalsignal often stalls
+    // 8–10s and used to burn the whole probe budget before others ran.
+    const seenUrl = new Set();
+    const seenHost = new Set();
+    const byHost = [];
+    for (const u of result.urls) {
+      if (!u || seenUrl.has(u)) continue;
+      seenUrl.add(u);
+      let host = "";
+      try {
+        host = new URL(u).hostname;
+      } catch {
+        continue;
+      }
+      if (seenHost.has(host)) continue;
+      seenHost.add(host);
+      byHost.push(u);
+    }
+    const movyHostScore = (u) => {
+      try {
+        const h = new URL(u).hostname;
+        if (/goldenkite\.top$/i.test(h)) return 0;
+        if (/workers\.dev$/i.test(h)) return 1;
+        if (/finalsignal\.top$/i.test(h)) return 3;
+        return 2;
+      } catch {
+        return 9;
+      }
+    };
+    byHost.sort((a, b) => movyHostScore(a) - movyHostScore(b));
+    const unique = byHost.slice(0, 4);
+    // Probe sequentially in preference order; stop at the first reachable
+    // mirror so a hung finalsignal can't wipe Movy from the response.
+    const streams = [];
+    for (const u of unique) {
+      const hit = await probeStreamUrls([u], 5000, 1);
+      if (hit.length) {
+        streams.push(...hit);
+        break;
+      }
+    }
+    if (!streams.length) console.warn(`[movy] manifest unreachable for ${type} ${tmdb_id}`);
+    return {
+      streams: streams.map((s) => ({ ...s, source: "movy" })),
+      subtitles: [],
+      transient: streams.length === 0,
+    };
+  } catch (error) {
+    console.error(`[movy] ${error.message}`);
+    return { streams: [], subtitles: [], transient: true };
+  }
+}
 
 // Merge every reachable stream from all sources, ordered by source
 // priority, then by highest working tier within a source. vaplayer is the
@@ -583,7 +761,7 @@ const scrapeOphim = (...a) => scrapeVidnestMasters("ophim", fetchOphimStreams, .
 // CDN stalls at random. ophim: same speed class as flixhq, same upstream
 // family, slightly less coverage. Every source with a working stream is
 // exposed in `mirrors` for the picker / ?source=.
-const SOURCE_PRIORITY = { vaplayer: 0, flixhq: 1, catflix: 2, ophim: 3 };
+const SOURCE_PRIORITY = { vaplayer: 0, movy: 1, flixhq: 2, catflix: 3, ophim: 4 };
 
 // Re-point a finished /extract response at one specific source (the
 // ?source= pin). `mirrors` is left intact so the client still sees every
@@ -605,10 +783,12 @@ function applySourceFilter(response, source) {
   return { ...response, hls_url: pick.hls_url, source: pick.source, quality: pick.quality, error: null };
 }
 function rankStreams(...streamLists) {
+  // Highest working resolution first; source priority only breaks ties so a
+  // reliable 720p source (vaplayer) no longer beats a confirmed 1080p mirror.
   return streamLists
     .flat()
     .map((s, index) => ({ ...s, index, tier: qualityTier(s), prio: SOURCE_PRIORITY[s.source] ?? 9 }))
-    .sort((a, b) => a.prio - b.prio || b.tier - a.tier || a.index - b.index)
+    .sort((a, b) => b.tier - a.tier || a.prio - b.prio || a.index - b.index)
     .map(({ index, tier, prio, ...s }) => s);
 }
 
@@ -667,19 +847,20 @@ function wordSetOverlap(a, b) {
   return inter / (a.size + b.size - inter);
 }
 
-// True when vaplayer's English pack and Wyzie's English pack clearly
-// describe different episodes/shows. No signal (missing either side, or
-// fetch failed) → false, so we don't demote on a flaky network.
-async function vaplayerPackMismatchesWyzie(extractorSubs, wyzieSubs) {
+// True when vaplayer's English pack clearly does not cover the TMDB
+// episode's title/overview. Prefer TMDB over Wyzie — Wyzie episode packs
+// are themselves sometimes shifted. No signal → false (don't demote on
+// flaky network / missing overview).
+async function vaplayerPackMismatchesTmdb(extractorSubs, tmdbRefWords) {
+  if (!tmdbRefWords || tmdbRefWords.size < 3) return false;
   const vap = extractorSubs.find((u) => /vidapi\.cloud\/subs\/[^/]+\/English\.eng\.srt/i.test(u));
-  const wyz = wyzieSubs.find((u) => /[?&]release=ENGLISH\./i.test(u));
-  if (!vap || !wyz) return false;
-  const [a, b] = await Promise.all([fetchTextHead(vap), fetchTextHead(wyz)]);
-  if (!a || !b) return false;
-  const sim = wordSetOverlap(subtitleCueWords(a), subtitleCueWords(b));
-  // Matching packs for the same episode typically land well above 0.2;
-  // Always Sunny's wrong pack scored ~0.02 after stopword filtering.
-  return sim < 0.1;
+  if (!vap) return false;
+  const text = await fetchTextHead(vap, 5000);
+  if (!text) return false;
+  const cov = refCoverage(tmdbRefWords, subtitleCueWords(text));
+  // Matching Always Sunny packs cover ~0.5+ of overview words; unrelated
+  // packs sit near 0–0.15.
+  return cov < 0.18;
 }
 
 // Secondary sources (vidnest) sometimes take 5–12s on a cold lookup. The
@@ -705,7 +886,7 @@ async function withBudget(source, scrape, softMs = SECONDARY_SOFT_MS, hardMs = S
   const hardExpired = new Promise((resolve) => {
     hardTimer = setTimeout(() => {
       console.warn(`[extract] ${source} missed the ${hardMs}ms hard budget; left out of this response`);
-      resolve({ streams: [], transient: true });
+      resolve({ streams: [], subtitles: [], transient: true });
     }, remaining);
   });
   try {
@@ -723,8 +904,9 @@ async function withBudget(source, scrape, softMs = SECONDARY_SOFT_MS, hardMs = S
 // also gives up on its own if the upstream hasn't produced headers within
 // UPSTREAM_HEADERS_TIMEOUT_MS, so a stalled CDN can't pin a socket open.
 const UPSTREAM_HEADERS_TIMEOUT_MS = 20000;
-async function fetchUpstreamWithRetry(target, attempts = 3, signal) {
+async function fetchUpstreamWithRetry(target, attempts = 3, signal, cdnHint) {
   let lastError;
+  let triedMovyFallback = Boolean(cdnHint === "movy");
   for (let i = 0; i < attempts; i++) {
     if (signal?.aborted) throw new Error("client disconnected");
     const attempt = new AbortController();
@@ -732,10 +914,24 @@ async function fetchUpstreamWithRetry(target, attempts = 3, signal) {
     signal?.addEventListener("abort", onAbort, { once: true });
     const timer = setTimeout(onAbort, UPSTREAM_HEADERS_TIMEOUT_MS);
     try {
-      const upstream = await fetchUpstream(target, { signal: attempt.signal });
+      const upstream = await fetchUpstream(target, { signal: attempt.signal, cdnHint });
       if (upstream.ok) return upstream;
-      discardBody(upstream);
-      lastError = new Error(`Upstream fetch failed with status ${upstream.status}`);
+      // Untagged Movy CDNs often 403 on the vaplayer Referer. One shot with
+      // Movy headers recovers rotating hostnames without a deploy.
+      if (upstream.status === 403 && !triedMovyFallback) {
+        discardBody(upstream);
+        triedMovyFallback = true;
+        const retry = await fetchUpstream(target, {
+          signal: attempt.signal,
+          cdnHint: "movy",
+        });
+        if (retry.ok) return retry;
+        discardBody(retry);
+        lastError = new Error(`Upstream fetch failed with status ${retry.status}`);
+      } else {
+        discardBody(upstream);
+        lastError = new Error(`Upstream fetch failed with status ${upstream.status}`);
+      }
     } catch (err) {
       lastError = err;
       if (signal?.aborted) throw new Error("client disconnected");
@@ -839,6 +1035,13 @@ async function* resumeStream(head, iterator, done) {
 app.get("/hls-proxy", async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).send("Missing url param");
+  // Set by /extract for sources whose CDNs rotate hostnames (movy). Propagated
+  // onto every rewritten child URL so segments keep the right Referer.
+  const cdnHint =
+    typeof req.query.cdn === "string" && CDN_HINT_HEADERS[req.query.cdn]
+      ? req.query.cdn
+      : undefined;
+  const cdnQS = cdnHint ? `&cdn=${encodeURIComponent(cdnHint)}` : "";
 
   const client = new AbortController();
   let upstream = null;
@@ -848,7 +1051,7 @@ app.get("/hls-proxy", async (req, res) => {
   });
 
   try {
-    upstream = await fetchUpstreamWithRetry(target, 3, client.signal);
+    upstream = await fetchUpstreamWithRetry(target, 3, client.signal, cdnHint);
     if (res.destroyed) {
       discardBody(upstream);
       return;
@@ -902,7 +1105,7 @@ app.get("/hls-proxy", async (req, res) => {
       // minimal synthetic master pointing back at itself with &variant=1, so
       // every stream we serve has the same master -> media -> segment shape.
       if (!isMaster && !isVariant) {
-        const selfUrl = `/hls-proxy?url=${encodeURIComponent(target)}&variant=1`;
+        const selfUrl = `/hls-proxy?url=${encodeURIComponent(target)}&variant=1${cdnQS}`;
         const master = [
           "#EXTM3U",
           "#EXT-X-INDEPENDENT-SEGMENTS",
@@ -916,11 +1119,12 @@ app.get("/hls-proxy", async (req, res) => {
       // Rewrite child URLs back through this proxy. Variant playlists inside
       // a master keep the &variant flag so the follow-up request is served
       // as media (and not wrapped again); segment URLs in a media playlist
-      // need no flag.
+      // need no flag. `&cdn=` rides along so Movy (etc.) keep their Referer
+      // even when the playlist rewrites onto a brand-new CDN hostname.
       // fMP4 streams (flixhq/ophim) also reference an init segment via
       // #EXT-X-MAP:URI="..." — and AES streams a key via #EXT-X-KEY — which
       // must come through here too, or browsers hit a worker with no CORS.
-      const childSuffix = isMaster ? "&variant=1" : "";
+      const childSuffix = isMaster ? `&variant=1${cdnQS}` : cdnQS;
       const proxyUrl = (ref, suffix = "") =>
         `/hls-proxy?url=${encodeURIComponent(new URL(ref, baseUrl).toString())}${suffix}`;
       const rewritten = text
@@ -929,7 +1133,10 @@ app.get("/hls-proxy", async (req, res) => {
           const trimmed = line.trim();
           if (!trimmed) return line;
           if (/^#EXT-X-(MAP|KEY|MEDIA):/i.test(trimmed)) {
-            return line.replace(/URI="([^"]+)"/i, (_, ref) => `URI="${proxyUrl(ref, isMaster ? "&variant=1" : "")}"`);
+            return line.replace(
+              /URI="([^"]+)"/i,
+              (_, ref) => `URI="${proxyUrl(ref, isMaster ? `&variant=1${cdnQS}` : cdnQS)}"`
+            );
           }
           if (trimmed.startsWith("#")) return line;
           return proxyUrl(trimmed, childSuffix);
@@ -985,7 +1192,7 @@ app.get("/hls-proxy", async (req, res) => {
 });
 
 //Extract endpoint for m3u8 scraper
-app.get("/extract", async (req, res) => {
+app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) => {
   const type = req.query.type || "movie";
   const tmdb_id = req.query.tmdb_id;
   const season = req.query.season ? parseInt(req.query.season) : undefined;
@@ -1042,63 +1249,97 @@ app.get("/extract", async (req, res) => {
       return [];
     });
 
-    // Resolve the upstream episode index against TMDB *before* scraping.
-    // Releases sometimes number episodes differently (Always Sunny S03
-    // swaps E07/E08); the corrected index is shared by every source so
-    // flixhq/ophim/catflix don't keep serving the swapped file. Wyzie
-    // above still uses the original TMDB season/episode for subtitles.
-    const resolvedEpisode =
-      type === "tv" ? await resolveTVEpisodeIndex(tmdb_id, season, episode) : episode;
+    // ?source=movy pin: skip episode-resolve + every other scraper. Movy
+    // already keys by TMDB S/E, and competing CDN probes were starving its
+    // city race (Always Sunny S4E9 was timing out under the shared budget).
+    let result, catflix, flixhq, ophim, movy, tmdbMeta;
+    if (wantedSource === "movy") {
+      const [movyOnly, metaOnly] = await Promise.all([
+        scrapeMovy(type, tmdb_id, season, episode),
+        type === "tv"
+          ? getTMDBEpisodeMeta(tmdb_id, season, episode).catch(() => null)
+          : Promise.resolve(null),
+      ]);
+      movy = movyOnly;
+      tmdbMeta = metaOnly;
+      result = { streams: [], subtitles: [], title: null, imdb_id: null };
+      catflix = { streams: [], subtitles: [] };
+      flixhq = { streams: [], subtitles: [] };
+      ophim = { streams: [], subtitles: [] };
+    } else {
+      // Movy keys by TMDB S/E (not vaplayer's index), so kick it off while
+      // episode-resolve runs — otherwise resolve's nearby search (~3–8s)
+      // + Movy's city race (~10s) + probe routinely miss the hard budget.
+      const movyPromise = withBudget(
+        "movy",
+        scrapeMovy(type, tmdb_id, season, episode),
+        SECONDARY_SOFT_MS,
+        20000
+      );
 
-    // All sources are independent, so resolve them concurrently. vaplayer
-    // also supplies title/imdb_id/subtitles used further down, so it always
-    // runs even when another source ends up winning. The others get a time
-    // budget: their lookups go through vidnest, whose backends scrape on
-    // demand and have been seen taking 10-20s per title, and a viewer
-    // should not wait on a mirror they may never pick. A source that misses
-    // the budget is simply left out of this response; its lookup carries on
-    // in the background and lands in the cache for the next request.
-    const [result, catflix, flixhq, ophim] = await Promise.all([
-      scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode),
-      withBudget("catflix", scrapeCatflix(type, tmdb_id, season, resolvedEpisode)),
-      withBudget("flixhq", scrapeFlixhq(type, tmdb_id, season, resolvedEpisode)),
-      withBudget("ophim", scrapeOphim(type, tmdb_id, season, resolvedEpisode)),
-    ]);
+      // Resolve the upstream episode index against TMDB *before* scraping
+      // vaplayer/vidnest. Some releases tag SxxEyy wrong; we match English
+      // dialogue against the TMDB title/overview (not Wyzie). Wyzie subtitle
+      // lookup above still uses the original TMDB S/E.
+      const tmdbMetaPromise =
+        type === "tv" ? getTMDBEpisodeMeta(tmdb_id, season, episode).catch(() => null) : Promise.resolve(null);
+      const resolvedEpisode =
+        type === "tv" ? await resolveTVEpisodeIndex(tmdb_id, season, episode) : episode;
 
-    // Subtitles first (needed before ranking): vaplayer's bundled
-    // default_subs are frequently a pack for the *wrong* title even when
-    // file_name says SxxEyy correctly (It's Always Sunny S01E01 shipped
-    // with dialogue from another show). Wyzie is keyed by TMDB id+episode,
-    // so it wins. When both expose English, a cheap dialogue overlap check
-    // demotes vaplayer for this response if the packs clearly disagree —
-    // same signal that the video file itself is likely wrong.
+      // All sources are independent, so resolve them concurrently. vaplayer
+      // also supplies title/imdb_id/subtitles used further down, so it always
+      // runs even when another source ends up winning. The others get a time
+      // budget: their lookups go through vidnest, whose backends scrape on
+      // demand and have been seen taking 10-20s per title, and a viewer
+      // should not wait on a mirror they may never pick. A source that misses
+      // the budget is simply left out of this response; its lookup carries on
+      // in the background and lands in the cache for the next request.
+      [result, catflix, flixhq, ophim, movy, tmdbMeta] = await Promise.all([
+        scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode),
+        withBudget("catflix", scrapeCatflix(type, tmdb_id, season, resolvedEpisode)),
+        withBudget("flixhq", scrapeFlixhq(type, tmdb_id, season, resolvedEpisode)),
+        withBudget("ophim", scrapeOphim(type, tmdb_id, season, resolvedEpisode)),
+        movyPromise,
+        tmdbMetaPromise,
+      ]);
+    }
+
+    // Subtitles first (needed before ranking): Wyzie first for languages;
+    // vaplayer pack is demoted when its English dialogue doesn't cover the
+    // TMDB episode synopsis (wrong file / wrong show). Source tracks stay
+    // appended under Wyzie so extra languages remain selectable.
     const extractorSubs = Array.isArray(result.subtitles) ? result.subtitles : [];
+    const flixhqSubs = Array.isArray(flixhq.subtitles) ? flixhq.subtitles : [];
+    const sourceSubs = [...extractorSubs, ...flixhqSubs];
     const wcands = await wyziePromise;
     const wyzieSubs = wcands.map(
       ({ downloadUrl, release }) => `${downloadUrl}&release=${encodeURIComponent(release)}`
     );
-    const vapUntrusted = await vaplayerPackMismatchesWyzie(extractorSubs, wyzieSubs);
+    const tmdbRefWords = tmdbEpisodeRefWords(tmdbMeta);
+    const vapUntrusted = await vaplayerPackMismatchesTmdb(extractorSubs, tmdbRefWords);
     if (vapUntrusted) {
       console.warn(
-        `[extract] vaplayer subtitle pack mismatches Wyzie for ${type} ${tmdb_id}` +
+        `[extract] vaplayer subtitle pack mismatches TMDB for ${type} ${tmdb_id}` +
           (type === "tv" ? ` S${season}E${episode}` : "") +
           "; demoting vaplayer"
       );
     }
 
-    // Wyzie first (episode-accurate). Drop vaplayer's pack entirely when
-    // untrusted; otherwise keep it after Wyzie for extra languages.
+    // Wyzie first (episode-accurate); source-bundled tracks always at the
+    // bottom (deduped). Wrong English packs stay selectable but last.
     const host = `${req.protocol}://${req.get("host")}`;
-    let subtitles = wyzieSubs.length
-      ? vapUntrusted
-        ? [...wyzieSubs]
-        : [...wyzieSubs, ...extractorSubs]
-      : [...extractorSubs];
+    const seenSub = new Set(wyzieSubs);
+    const appendedSourceSubs = sourceSubs.filter((u) => {
+      if (seenSub.has(u)) return false;
+      seenSub.add(u);
+      return true;
+    });
+    let subtitles = [...wyzieSubs, ...appendedSourceSubs];
 
     const vapStreams = vapUntrusted ? [] : result.streams;
     const demotedVap = vapUntrusted ? result.streams : [];
     const streams = [
-      ...rankStreams(vapStreams, catflix.streams, flixhq.streams, ophim.streams),
+      ...rankStreams(vapStreams, movy.streams, catflix.streams, flixhq.streams, ophim.streams),
       ...demotedVap.map((s) => ({ ...s, source: "vaplayer" })),
     ];
     // Deduplicate URLs if demotion somehow double-counted (shouldn't).
@@ -1118,7 +1359,13 @@ app.get("/extract", async (req, res) => {
     }
 
     const origin = `${req.protocol}://${req.get("host")}`;
-    const proxied = (s) => `${origin}/hls-proxy?url=${encodeURIComponent(s.url)}`;
+    // Stamp &cdn= so /hls-proxy doesn't depend on hostname allowlists for
+    // sources that rotate CDNs (Movy). Child playlist rewrites preserve it.
+    const proxied = (s) => {
+      const cdn =
+        s.source === "movy" ? "&cdn=movy" : s.source === "catflix" ? "&cdn=catflix" : "";
+      return `${origin}/hls-proxy?url=${encodeURIComponent(s.url)}${cdn}`;
+    };
     const proxiedHlsUrl = best ? proxied(best) : null;
     // One entry per source that has a working stream, in priority order,
     // each pointing at that source's best stream. hls_url is always
@@ -1270,7 +1517,7 @@ async function getSubtitleDownloadUrl(file_id) {
 /**
  * 🔥 Subtitles Endpoint (for movies only)
  */
-app.get("/movie-subtitles", async (req, res) => {
+app.get("/movie-subtitles", ...requirePremiumAccess, async (req, res) => {
   const { tmdb_id, type = "movie" } = req.query;
 
   if (!tmdb_id) {
@@ -1323,7 +1570,7 @@ app.get("/movie-subtitles", async (req, res) => {
 /**
  * Subtitles Endpoint (for TV Shows only)
  */
-app.get("/tv-subtitles", async (req, res) => {
+app.get("/tv-subtitles", ...requirePremiumAccess, async (req, res) => {
   const { title, season, episode, type } = req.query;
 
   try {
@@ -1346,7 +1593,7 @@ app.get("/tv-subtitles", async (req, res) => {
  * CORS, Cloudflare), so we proxy + decode server-side. Downloads are cached
  * by URL in the Wyzie module.
  */
-app.get("/wyzie-subtitle-srt", async (req, res) => {
+app.get("/wyzie-subtitle-srt", ...requirePremiumAccess, async (req, res) => {
   const downloadUrl = req.query.url;
   if (!downloadUrl) return res.status(400).send("Missing url param");
 
@@ -1363,7 +1610,7 @@ app.get("/wyzie-subtitle-srt", async (req, res) => {
 /**
  * addic7ed subtitle download URL -> raw .srt proxy (TV, no API key needed)
  */
-app.get("/tv-subtitle-srt", async (req, res) => {
+app.get("/tv-subtitle-srt", ...requirePremiumAccess, async (req, res) => {
   const downloadUrl = req.query.url;
   if (!downloadUrl) return res.status(400).send("Missing url param");
 
@@ -1381,7 +1628,7 @@ app.get("/tv-subtitle-srt", async (req, res) => {
  * tvsubtitles.net fallback (used when addic7ed fails) — lazy, since the
  * full lookup chain takes 30-90s and would stall /extract if run inline.
  */
-app.get("/tv-subtitle-srt-fallback", async (req, res) => {
+app.get("/tv-subtitle-srt-fallback", ...requirePremiumAccess, async (req, res) => {
   const { title, season, episode } = req.query;
   if (!title || !season || !episode) {
     return res.status(400).send("Missing title, season, or episode param");
@@ -1401,7 +1648,7 @@ app.get("/tv-subtitle-srt-fallback", async (req, res) => {
 /**
  * YIFY/YTS subtitle zip -> VTT proxy (movies only, no API key needed)
  */
-app.get("/movie-subtitle-vtt", async (req, res) => {
+app.get("/movie-subtitle-vtt", ...requirePremiumAccess, async (req, res) => {
   const zipUrl = req.query.url;
   if (!zipUrl) return res.status(400).send("Missing url param");
 
@@ -1418,7 +1665,7 @@ app.get("/movie-subtitle-vtt", async (req, res) => {
 /**
  * YIFY/YTS subtitle zip -> raw SRT proxy (movies only, no API key needed)
  */
-app.get("/movie-subtitle-srt", async (req, res) => {
+app.get("/movie-subtitle-srt", ...requirePremiumAccess, async (req, res) => {
   const zipUrl = req.query.url;
   if (!zipUrl) return res.status(400).send("Missing url param");
 
@@ -1435,7 +1682,7 @@ app.get("/movie-subtitle-srt", async (req, res) => {
 /**
  * 📦 Subtitle Proxy to Convert .srt → .vtt (for movies only)
  */
-app.get("/subtitle-proxy", async (req, res) => {
+app.get("/subtitle-proxy", ...requirePremiumAccess, async (req, res) => {
   const fileUrl = req.query.url;
   if (!fileUrl) return res.status(400).send("Missing subtitle URL");
 
@@ -1469,7 +1716,7 @@ app.get("/", (req, res) => {
 // Proxy for introdb.app skip-segments (recap/intro/outro). introdb only sends
 // CORS for its own origin, so the web app can't call it directly — it calls
 // this instead (our open CORS). Native still hits introdb directly.
-app.get("/segments", async (req, res) => {
+app.get("/segments", ...requirePremiumAccess, async (req, res) => {
   const { imdb_id, season, episode } = req.query;
   if (!imdb_id) return res.status(400).json({ error: "imdb_id required" });
   try {

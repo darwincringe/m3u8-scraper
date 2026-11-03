@@ -1,0 +1,14 @@
+---
+description: Always commit and push after shipping changes; deploy to droplet when prod is affected
+alwaysApply: true
+---
+
+# Always commit & push
+
+After finishing work that changes this repo:
+
+1. **Commit** with a concise message focused on why.
+2. **Push** to `origin` on the current branch (usually `master`).
+3. If the change affects production API behavior, **deploy** to the droplet (`rsync` → `/var/www/m3u8-scraper` + `pm2 restart backend`) as well — do not leave prod only on local disk.
+
+Do not wait to be asked. Skip only secrets (`.env`, credentials) and warn if those are staged.

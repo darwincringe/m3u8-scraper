@@ -35,6 +35,9 @@ export async function ensureIndexes() {
   await db.collection("users").createIndexes([
     { key: { username: 1 }, unique: true },
     { key: { email: 1 }, unique: true },
+    { key: { premium: 1 } },
+    { key: { admin: 1 } },
+    { key: { createdAt: -1 } },
   ]);
   await db.collection("watch_progress").createIndexes([
     { key: { userId: 1, mediaType: 1, tmdbId: 1 }, unique: true },
@@ -52,4 +55,31 @@ export async function ensureIndexes() {
     { key: { userId: 1, mediaType: 1, tmdbId: 1 }, unique: true },
     { key: { userId: 1, recordedAt: -1 } },
   ]);
+}
+
+// Idempotent privilege migration: default everyone to locked-out free users,
+// then promote darwinchu to admin + never-expiring premium.
+export async function migrateUserPrivileges() {
+  const users = (await getDb()).collection("users");
+  await users.updateMany(
+    { admin: { $exists: false } },
+    { $set: { admin: 0 } }
+  );
+  await users.updateMany(
+    { premium: { $exists: false } },
+    { $set: { premium: 0 } }
+  );
+  await users.updateMany(
+    { premium_expires_at: { $exists: false } },
+    { $set: { premium_expires_at: null } }
+  );
+  const seed = await users.updateOne(
+    { username: "darwinchu" },
+    { $set: { admin: 1, premium: 1, premium_expires_at: null } }
+  );
+  if (seed.matchedCount) {
+    console.log("Seeded darwinchu as admin + premium (no expiry)");
+  } else {
+    console.warn("migrateUserPrivileges: username darwinchu not found — create/login once then restart");
+  }
 }
