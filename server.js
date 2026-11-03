@@ -18,6 +18,11 @@ import {
   findWyzieMovieSubtitleCandidates,
   downloadWyzieSubtitleSRT,
 } from "./utils/wyzieSubtitles.js";
+import {
+  searchOpenSubtitles,
+  downloadOpenSubtitlesSrt,
+  opensubtitlesConfigured,
+} from "./utils/opensubtitles.js";
 import { registerSyncRoutes, requireAuth, requirePremium } from "./srctvSync.js";
 import { fetchCatflixStream, fetchFlixhqStreams, fetchOphimStreams } from "./utils/catflix.js";
 import { fetchMovyStreams } from "./utils/wecollege.js";
@@ -1609,6 +1614,115 @@ app.get("/movie-subtitles", ...requirePremiumAccess, async (req, res) => {
   } catch (err) {
     console.error("[/subtitles] Error:", err.message);
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * User-driven OpenSubtitles search (official REST API).
+ * Same idea as bipuldey19/Opensubtitles-Unofficial-API (free-text + S/E
+ * filters), but via api.opensubtitles.com — HTML scraping is blocked from
+ * our droplet. Requires OPENSUB_API_KEY.
+ *
+ *   GET /opensubtitles/search?q=The+Last+of+Us&season=1&episode=1&lang=en
+ *   GET /opensubtitles/search?tmdb_id=100088&type=tv&season=1&episode=1
+ *   GET /opensubtitles/search?parent_tmdb_id=100088&season=1&episode=1&lang=en
+ *
+ * Each result includes `srt_url` pointing at /opensubtitles/srt?file_id=…
+ * so the player can load the pick without hitting OpenSubtitles directly.
+ */
+app.get("/opensubtitles/search", ...requirePremiumAccess, async (req, res) => {
+  if (!opensubtitlesConfigured()) {
+    return res.status(503).json({
+      success: false,
+      error:
+        "OPENSUB_API_KEY is not configured. Create a free key at https://www.opensubtitles.com/en/consumers and set it in .env",
+    });
+  }
+
+  const q = req.query.q || req.query.query;
+  const lang = req.query.lang || req.query.languages || "en";
+  const type = req.query.type;
+  const season = req.query.season ?? req.query.s;
+  const episode = req.query.episode ?? req.query.e;
+  const tmdb_id = req.query.tmdb_id;
+  const parent_tmdb_id = req.query.parent_tmdb_id;
+  const imdb_id = req.query.imdb_id;
+  const parent_imdb_id = req.query.parent_imdb_id;
+  const year = req.query.year;
+  const page = req.query.page || 1;
+  const limit = req.query.limit || 40;
+
+  try {
+    // Convenience: for TV, tmdb_id without parent_ means the show id.
+    let parentTmdb = parent_tmdb_id;
+    let featureTmdb = tmdb_id;
+    const isTv =
+      mediaLooksLikeTv(type) || (season != null && season !== "") || (episode != null && episode !== "");
+    if (isTv && tmdb_id && !parent_tmdb_id) {
+      parentTmdb = tmdb_id;
+      featureTmdb = undefined;
+    }
+
+    const data = await searchOpenSubtitles({
+      query: q,
+      languages: lang,
+      type: isTv ? "episode" : type || "movie",
+      season,
+      episode,
+      tmdb_id: featureTmdb,
+      parent_tmdb_id: parentTmdb,
+      imdb_id,
+      parent_imdb_id,
+      year,
+      page,
+      limit,
+    });
+
+    const origin = `${req.protocol}://${req.get("host")}`;
+    const results = data.results.map((r) => ({
+      ...r,
+      srt_url: `${origin}/opensubtitles/srt?file_id=${encodeURIComponent(r.file_id)}`,
+    }));
+
+    res.json({
+      success: true,
+      results,
+      total: data.total,
+      page: data.page,
+      total_pages: data.total_pages,
+    });
+  } catch (err) {
+    console.error("[opensubtitles/search]", err.message);
+    res.status(err.status && Number.isInteger(err.status) ? err.status : 500).json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
+function mediaLooksLikeTv(type) {
+  const t = String(type || "").toLowerCase();
+  return t === "tv" || t === "series" || t === "episode" || t === "show";
+}
+
+/**
+ * Proxy an OpenSubtitles file_id to decoded SRT text (CORS-safe for players).
+ */
+app.get("/opensubtitles/srt", ...requirePremiumAccess, async (req, res) => {
+  const file_id = req.query.file_id;
+  if (!file_id) return res.status(400).send("Missing file_id");
+  if (!opensubtitlesConfigured()) {
+    return res.status(503).send("OPENSUB_API_KEY is not configured");
+  }
+
+  try {
+    const srt = await downloadOpenSubtitlesSrt(file_id);
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.send(srt);
+  } catch (err) {
+    console.error("[opensubtitles/srt]", err.message);
+    res.status(err.status && Number.isInteger(err.status) ? err.status : 500).send(err.message);
   }
 });
 

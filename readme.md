@@ -44,6 +44,22 @@ The cron job loads `.env` (so `CATFLIX_RELAY` / `CATFLIX_RELAY_KEY` are set) and
 
 ---
 
+## OpenSubtitles user search
+
+When auto-picked Wyzie/vaplayer subs are wrong, the client can let the user search and pick:
+
+```
+GET /opensubtitles/search?q=The+Last+of+Us&season=1&episode=1&lang=en
+GET /opensubtitles/search?tmdb_id=100088&type=tv&season=1&episode=1&lang=en
+GET /opensubtitles/srt?file_id=123456789
+```
+
+Requires `OPENSUB_API_KEY` in `.env` (free consumer key from https://www.opensubtitles.com/en/consumers). HTML scraping of opensubtitles.org is blocked from the droplet, so this uses the official REST API instead of the unofficial scraper approach.
+
+Each search hit includes `srt_url` pointing at `/opensubtitles/srt?file_id=…` for the player.
+
+---
+
 ## Features
 
 - `/extract` with multi-source mirrors (`vaplayer`, `flixhq`, `catflix`, `ophim`) and optional `?source=`
