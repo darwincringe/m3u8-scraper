@@ -77,6 +77,53 @@ export const LANGUAGE_NAMES = {
 
 export const COMMON_LANGUAGES = Object.keys(LANGUAGE_NAMES);
 
+// /extract response cache. Cold scrapes (Movy city race + probes) can take
+// 10–20s; warm hits should be instant. Source pin (?source=) is applied on
+// the way out so one entry serves every picker variant. Short TTL when a
+// secondary source flaked so the next viewer retries for a better mirror.
+const CACHE_TTL_MS = 1000 * 60 * 15;
+const CACHE_TTL_TRANSIENT_MS = 1000 * 60 * 2;
+const extractCache = new Map();
+const extractInflight = new Map();
+const cacheEntryExpired = (entry, now = Date.now()) =>
+  now - entry.timestamp >= (entry.ttl ?? CACHE_TTL_MS);
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of extractCache) {
+    if (cacheEntryExpired(entry, now)) extractCache.delete(key);
+  }
+}, 60 * 1000).unref();
+
+function extractCacheKey({ type, tmdb_id, season, episode }) {
+  return JSON.stringify({
+    type,
+    tmdb_id: String(tmdb_id),
+    season: season == null || season === "" ? null : String(season),
+    episode: episode == null || episode === "" ? null : String(episode),
+  });
+}
+
+// Cached responses were built with whatever Host the first request used;
+// rewrite absolute proxy URLs to the current request origin.
+function rehostExtractResponse(response, origin) {
+  const fix = (u) => {
+    if (typeof u !== "string" || !/^https?:\/\//i.test(u)) return u;
+    try {
+      const parsed = new URL(u);
+      if (!/\/(hls-proxy|tv-subtitle|movie-subtitle)/.test(parsed.pathname)) return u;
+      return `${origin}${parsed.pathname}${parsed.search}`;
+    } catch {
+      return u;
+    }
+  };
+  return {
+    ...response,
+    hls_url: fix(response.hls_url),
+    mirrors: (response.mirrors || []).map((m) => ({ ...m, hls_url: fix(m.hls_url) })),
+    subtitles: (response.subtitles || []).map(fix),
+  };
+}
+
 // Each upstream CDN wants to see the Referer of the player it was minted
 // for. vaplayer.ru mirrors check for nextgencloudfabric.com; the Catflix
 // chain (pwcloud.animanga.fun manifests, segments disguised as PNGs on
@@ -719,10 +766,18 @@ async function scrapeMovy(type, tmdb_id, season, episode) {
     let meta = await fetchMovyMeta(type, tmdb_id);
     // Fall back to vaplayer's title/imdb when TMDB is down — enough for most cities.
     if (!meta?.title) return { streams: [], subtitles: [], transient: false };
-    // City race alone often needs ~8–11s; keep headroom for seed + probe.
-    const result = await fetchMovyStreams(type, tmdb_id, season, episode, meta, 18000);
+    // No extract-level budget: wait for the city race. Cache on /extract
+    // makes the next hit cheap.
+    const result = await fetchMovyStreams(type, tmdb_id, season, episode, meta, 30000);
+    // Keep 1080p + 2K/4K only (drop 720/480/360). "Auto"/unlabeled still
+    // probed in case the master actually carries 1080+.
     const candidates = (result?.streams || [])
       .filter((s) => s?.url && !/\.json(\?|$)/i.test(s.url))
+      .filter((s) => {
+        const claimed = claimedQualityDims(s.quality);
+        if (!claimed) return true;
+        return qualityTier(claimed) >= 1080;
+      })
       .slice(0, 12);
     if (!candidates.length) return { streams: [], subtitles: [], transient: false };
 
@@ -732,14 +787,16 @@ async function scrapeMovy(type, tmdb_id, season, episode) {
     const claimedByUrl = new Map(candidates.map((s) => [s.url, s.quality]));
     const probed = await probeStreamUrls(
       candidates.map((s) => s.url),
-      6000,
+      8000,
       1
     );
-    const streams = probed.map((s) => {
-      if (s.width || s.height) return { ...s, source: "movy" };
-      const claimed = claimedQualityDims(claimedByUrl.get(s.url));
-      return claimed ? { ...s, ...claimed, source: "movy" } : { ...s, source: "movy" };
-    });
+    const streams = probed
+      .map((s) => {
+        if (s.width || s.height) return { ...s, source: "movy" };
+        const claimed = claimedQualityDims(claimedByUrl.get(s.url));
+        return claimed ? { ...s, ...claimed, source: "movy" } : { ...s, source: "movy" };
+      })
+      .filter((s) => qualityTier(s) >= 1080);
     if (!streams.length) console.warn(`[movy] manifest unreachable for ${type} ${tmdb_id}`);
     return {
       streams,
@@ -863,39 +920,6 @@ async function vaplayerPackMismatchesTmdb(extractorSubs, tmdbRefWords) {
   // Matching Always Sunny packs cover ~0.5+ of overview words; unrelated
   // packs sit near 0–0.15.
   return cov < 0.18;
-}
-
-// Secondary sources (vidnest) sometimes take 5–12s on a cold lookup. The
-// old hard 4s race dropped them from the response and only showed them on
-// refresh #2–3 once the cache was warm — which felt like "sources missing."
-// Soft budget is just a log line; we keep waiting for the real scrape up to
-// the hard cap so mirrors are correct on the first hit.
-const SECONDARY_SOFT_MS = parseInt(process.env.SECONDARY_SOURCE_BUDGET_MS || "4000", 10);
-const SECONDARY_HARD_MS = parseInt(process.env.SECONDARY_SOURCE_HARD_MS || "12000", 10);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function withBudget(source, scrape, softMs = SECONDARY_SOFT_MS, hardMs = SECONDARY_HARD_MS) {
-  const started = Date.now();
-  const resultPromise = Promise.resolve(scrape);
-  const soft = await Promise.race([
-    resultPromise.then((r) => ({ done: true, r })),
-    sleep(softMs).then(() => ({ done: false })),
-  ]);
-  if (soft.done) return soft.r;
-
-  console.warn(`[extract] ${source} still running after ${softMs}ms; waiting up to ${hardMs}ms`);
-  const remaining = Math.max(0, hardMs - (Date.now() - started));
-  let hardTimer;
-  const hardExpired = new Promise((resolve) => {
-    hardTimer = setTimeout(() => {
-      console.warn(`[extract] ${source} missed the ${hardMs}ms hard budget; left out of this response`);
-      resolve({ streams: [], subtitles: [], transient: true });
-    }, remaining);
-  });
-  try {
-    return await Promise.race([resultPromise, hardExpired]);
-  } finally {
-    clearTimeout(hardTimer);
-  }
 }
 
 // Some CDN mirrors (e.g. startupscalingsystem.website) intermittently drop
@@ -1234,9 +1258,61 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
     });
   }
 
-  // No response caching: every call re-resolves all sources so a viewer
-  // always gets the live state of each CDN (what's up, what quality is
-  // actually reachable right now) rather than a snapshot from minutes ago.
+  const origin = `${req.protocol}://${req.get("host")}`;
+  const cacheKey = extractCacheKey({ type, tmdb_id, season, episode });
+  const cached = extractCache.get(cacheKey);
+  if (cached && !cacheEntryExpired(cached)) {
+    console.log(`[extract] cache hit ${cacheKey}`);
+    return res.json(
+      applySourceFilter(rehostExtractResponse(cached.response, origin), wantedSource)
+    );
+  }
+
+  // Coalesce concurrent cold lookups for the same title so Movy's city race
+  // only runs once when several viewers hit play together.
+  let inflight = extractInflight.get(cacheKey);
+  if (!inflight) {
+    inflight = (async () => {
+      try {
+        return await buildExtractResponse({
+          type,
+          tmdb_id,
+          season,
+          episode,
+          origin,
+        });
+      } finally {
+        extractInflight.delete(cacheKey);
+      }
+    })();
+    extractInflight.set(cacheKey, inflight);
+  } else {
+    console.log(`[extract] joining inflight ${cacheKey}`);
+  }
+
+  try {
+    const { response, transient } = await inflight;
+    if (response.success) {
+      extractCache.set(cacheKey, {
+        timestamp: Date.now(),
+        ttl: transient ? CACHE_TTL_TRANSIENT_MS : CACHE_TTL_MS,
+        response,
+      });
+    }
+    res.json(applySourceFilter(rehostExtractResponse(response, origin), wantedSource));
+  } catch (err) {
+    console.error("[extract] Unexpected error:", err.message);
+    res.status(500).json({
+      success: false,
+      error: "Unexpected server error",
+      hls_url: null,
+      mirrors: [],
+      subtitles: [],
+    });
+  }
+});
+
+async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) {
   try {
     // Wyzie is independent of everything below, so start it now and collect
     // it after the sources instead of paying its ~0.8s on top of them.
@@ -1251,72 +1327,28 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
       return [];
     });
 
-    // ?source=movy pin: skip episode-resolve + every other scraper. Movy
-    // already keys by TMDB S/E, and competing CDN probes were starving its
-    // city race (Always Sunny S4E9 was timing out under the shared budget).
-    let result, catflix, flixhq, ophim, movy, tmdbMeta;
-    if (wantedSource === "movy") {
-      const [movyOnly, metaOnly] = await Promise.all([
-        scrapeMovy(type, tmdb_id, season, episode),
-        type === "tv"
-          ? getTMDBEpisodeMeta(tmdb_id, season, episode).catch(() => null)
-          : Promise.resolve(null),
-      ]);
-      movy = movyOnly;
-      tmdbMeta = metaOnly;
-      result = { streams: [], subtitles: [], title: null, imdb_id: null };
-      catflix = { streams: [], subtitles: [] };
-      flixhq = { streams: [], subtitles: [] };
-      ophim = { streams: [], subtitles: [] };
-    } else {
-      // Movy / flixhq / ophim / catflix all key by TMDB S/E (not vaplayer's
-      // remapped index), so start them with the *original* episode while
-      // episode-resolve runs. That stops Movy's long city+probe from pushing
-      // flixhq/ophim past their budget (they were vanishing from mirrors).
-      const secondaryHardMs = 20000;
-      const movyPromise = withBudget(
-        "movy",
-        scrapeMovy(type, tmdb_id, season, episode),
-        SECONDARY_SOFT_MS,
-        secondaryHardMs
-      );
-      const flixhqPromise = withBudget(
-        "flixhq",
-        scrapeFlixhq(type, tmdb_id, season, episode),
-        SECONDARY_SOFT_MS,
-        secondaryHardMs
-      );
-      const ophimPromise = withBudget(
-        "ophim",
-        scrapeOphim(type, tmdb_id, season, episode),
-        SECONDARY_SOFT_MS,
-        secondaryHardMs
-      );
-      const catflixPromise = withBudget(
-        "catflix",
-        scrapeCatflix(type, tmdb_id, season, episode),
-        SECONDARY_SOFT_MS,
-        secondaryHardMs
-      );
+    // No per-source budget: wait for every scraper. /extract response cache
+    // + inflight coalesce keep repeat plays fast. Movy / flixhq / ophim /
+    // catflix key by TMDB S/E (not vaplayer's remapped index), so start them
+    // with the original episode while episode-resolve runs for vaplayer.
+    const movyPromise = scrapeMovy(type, tmdb_id, season, episode);
+    const flixhqPromise = scrapeFlixhq(type, tmdb_id, season, episode);
+    const ophimPromise = scrapeOphim(type, tmdb_id, season, episode);
+    const catflixPromise = scrapeCatflix(type, tmdb_id, season, episode);
 
-      // Resolve the upstream episode index against TMDB for vaplayer only.
-      // Some releases tag SxxEyy wrong; we match English dialogue against the
-      // TMDB title/overview (not Wyzie). Wyzie subtitle lookup above still
-      // uses the original TMDB S/E.
-      const tmdbMetaPromise =
-        type === "tv" ? getTMDBEpisodeMeta(tmdb_id, season, episode).catch(() => null) : Promise.resolve(null);
-      const resolvedEpisode =
-        type === "tv" ? await resolveTVEpisodeIndex(tmdb_id, season, episode) : episode;
+    const tmdbMetaPromise =
+      type === "tv" ? getTMDBEpisodeMeta(tmdb_id, season, episode).catch(() => null) : Promise.resolve(null);
+    const resolvedEpisode =
+      type === "tv" ? await resolveTVEpisodeIndex(tmdb_id, season, episode) : episode;
 
-      [result, catflix, flixhq, ophim, movy, tmdbMeta] = await Promise.all([
-        scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode),
-        catflixPromise,
-        flixhqPromise,
-        ophimPromise,
-        movyPromise,
-        tmdbMetaPromise,
-      ]);
-    }
+    const [result, catflix, flixhq, ophim, movy, tmdbMeta] = await Promise.all([
+      scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode),
+      catflixPromise,
+      flixhqPromise,
+      ophimPromise,
+      movyPromise,
+      tmdbMetaPromise,
+    ]);
 
     // Subtitles first (needed before ranking): Wyzie first for languages;
     // vaplayer pack is demoted when its English dialogue doesn't cover the
@@ -1341,7 +1373,6 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
 
     // Wyzie first (episode-accurate); source-bundled tracks always at the
     // bottom (deduped). Wrong English packs stay selectable but last.
-    const host = `${req.protocol}://${req.get("host")}`;
     const seenSub = new Set(wyzieSubs);
     const appendedSourceSubs = sourceSubs.filter((u) => {
       if (seenSub.has(u)) return false;
@@ -1372,7 +1403,6 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
       );
     }
 
-    const origin = `${req.protocol}://${req.get("host")}`;
     // Stamp &cdn= so /hls-proxy doesn't depend on hostname allowlists for
     // sources that rotate CDNs (Movy). Child playlist rewrites preserve it.
     const proxied = (s) => {
@@ -1381,9 +1411,9 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
       return `${origin}/hls-proxy?url=${encodeURIComponent(s.url)}${cdn}`;
     };
     const proxiedHlsUrl = best ? proxied(best) : null;
-    // One entry per source+quality (so Movy can expose 2160p/1080p/720p/480p
-    // side by side). Ordered by rankStreams (highest quality first). hls_url
-    // is always mirrors[0] unless ?source= pins another source.
+    // One entry per source+quality. Movy only keeps 1080p/2160p; other
+    // sources usually expose a single master. hls_url is mirrors[0] unless
+    // ?source= pins another source.
     const mirrors = [];
     for (const s of uniqueStreams) {
       const quality = qualityLabel(s);
@@ -1401,7 +1431,7 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
           const candidates = await findEnglishSubtitleZips(result.imdb_id, 10);
           subtitles = candidates.map(
             ({ zipUrl, release }) =>
-              `${host}/movie-subtitle-srt?url=${encodeURIComponent(zipUrl)}&release=${encodeURIComponent(release)}`
+              `${origin}/movie-subtitle-srt?url=${encodeURIComponent(zipUrl)}&release=${encodeURIComponent(release)}`
           );
         } catch (err) {
           console.error("[extract] YIFY subtitle fallback failed:", err.message);
@@ -1412,7 +1442,7 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
           const candidates = await findTVSubtitleCandidates(result.title, season, episode, 10);
           subtitles = candidates.map(
             ({ downloadUrl, release }) =>
-              `${host}/tv-subtitle-srt?url=${encodeURIComponent(downloadUrl)}&release=${encodeURIComponent(release)}`
+              `${origin}/tv-subtitle-srt?url=${encodeURIComponent(downloadUrl)}&release=${encodeURIComponent(release)}`
           );
         } catch (err) {
           console.error("[extract] addic7ed subtitle fallback failed:", err.message);
@@ -1420,7 +1450,7 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
         }
         if (subtitles.length === 0 && addic7edFailed) {
           subtitles = [
-            `${host}/tv-subtitle-srt-fallback?title=${encodeURIComponent(result.title)}&season=${season}&episode=${episode}`,
+            `${origin}/tv-subtitle-srt-fallback?title=${encodeURIComponent(result.title)}&season=${season}&episode=${episode}`,
           ];
         }
       }
@@ -1435,18 +1465,18 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
       subtitles,
       error: best ? null : result.error || "No stream found",
     };
-
-    res.json(applySourceFilter(response, wantedSource));
+    const transient = !!(
+      catflix.transient ||
+      flixhq.transient ||
+      ophim.transient ||
+      movy.transient
+    );
+    return { response, transient };
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: "Unexpected server error",
-      hls_url: null,
-      mirrors: [],
-      subtitles: [],
-    });
+    console.error("[extract] build failed:", err.message);
+    throw err;
   }
-});
+}
 
 /**
  * 🎯 TMDB -> IMDb (for movies only)
