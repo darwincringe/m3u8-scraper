@@ -26,8 +26,9 @@ import {
 import { registerSyncRoutes, requireAuth, requirePremium } from "./srctvSync.js";
 import { fetchCatflixStream, fetchFlixhqStreams, fetchOphimStreams } from "./utils/catflix.js";
 import { fetchMovyStreams, NASHVILLE_CITY } from "./utils/wecollege.js";
+import { ensureDashHls, dashHlsHash, readDashHlsFile } from "./utils/dashHls.js";
 import { Readable } from "stream";
-import { readFileSync } from "fs";
+import fs, { readFileSync } from "fs";
 import http from "http";
 import https from "https";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
@@ -214,6 +215,17 @@ function discardBody(res) {
   } catch {}
 }
 
+// finalsignal MPDs HTML-escape query ampersands (`&amp;`). Leaving those in
+// the upstream URL makes the CDN return 410, which looked like "endless
+// loading" on the player.
+function decodeXmlEntities(s) {
+  return String(s)
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
+}
+
 // Rewrite a DASH MPD so every segment URL goes through /hls-proxy. BaseURL
 // query-param proxies break relative resolution, so SegmentTemplate refs are
 // expanded to absolute CDN URLs and then proxied; BaseURL tags are cleared.
@@ -226,7 +238,7 @@ function rewriteDashMpd(text, playlistUrl, cdnQS = "") {
   try {
     if (baseTags.length) segBase = new URL(baseTags[0], docUrl).toString();
   } catch {}
-  if (!/[?/#]$/.test(segBase) && !segBase.endsWith("/")) {
+  if (!segBase.endsWith("/")) {
     // SegmentTemplate paths are relative to the BaseURL directory.
     try {
       const u = new URL(segBase);
@@ -243,7 +255,7 @@ function rewriteDashMpd(text, playlistUrl, cdnQS = "") {
     /\b(initialization|media)="([^"]+)"/gi,
     (_, attr, ref) => {
       try {
-        const abs = new URL(ref, segBase).toString();
+        const abs = new URL(decodeXmlEntities(ref), segBase).toString();
         return `${attr}="${proxyAbs(abs)}"`;
       } catch {
         return `${attr}="${ref}"`;
@@ -1225,6 +1237,58 @@ async function* resumeStream(head, iterator, done) {
 // segment sits in kernel socket buffers (CLOSE_WAIT) plus node's stream
 // buffers — about 1-10 MB per zombie — until the process restarts. That is
 // exactly how a 1 GB host ends up swapped out after a couple of days.
+// Nashville DASH → HLS remux. Playlist waits for the first ffmpeg segment;
+// subsequent segment requests are served from /tmp cache.
+app.get("/dash-hls/:hash/:file", async (req, res) => {
+  const src = typeof req.query.src === "string" ? req.query.src : "";
+  const file = String(req.params.file || "");
+  if (!src || !/^https?:\/\//i.test(src)) {
+    return res.status(400).send("Missing src");
+  }
+  if (dashHlsHash(src) !== req.params.hash) {
+    return res.status(400).send("Hash mismatch");
+  }
+  try {
+    if (/^index\.m3u8$/i.test(file)) {
+      await ensureDashHls(src);
+      const full = readDashHlsFile(src, "index.m3u8");
+      if (!full) return res.status(502).send("Remux not ready");
+      let text = fs.readFileSync(full, "utf8");
+      // Rewrite segment URIs so they keep ?src= for the shared cache key.
+      const qs = `?src=${encodeURIComponent(src)}`;
+      text = text
+        .split("\n")
+        .map((line) => {
+          const t = line.trim();
+          if (!t || t.startsWith("#")) return line;
+          if (/^seg_\d+\.ts$/i.test(t)) return `${t}${qs}`;
+          return line;
+        })
+        .join("\n");
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.setHeader("Cache-Control", "no-cache");
+      return res.send(text);
+    }
+    if (/^seg_\d+\.ts$/i.test(file)) {
+      // Playlist may race ahead of a segment on a slow encode — wait briefly.
+      const started = Date.now();
+      let full = readDashHlsFile(src, file);
+      while (!full && Date.now() - started < 20000) {
+        await new Promise((r) => setTimeout(r, 400));
+        full = readDashHlsFile(src, file);
+      }
+      if (!full) return res.status(404).send("Segment not ready");
+      res.setHeader("Content-Type", "video/mp2t");
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      return fs.createReadStream(full).pipe(res);
+    }
+    return res.status(404).send("Not found");
+  } catch (err) {
+    console.error("[dash-hls]", err.message);
+    if (!res.headersSent) res.status(502).send("Remux failed");
+  }
+});
+
 app.get("/hls-proxy", async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).send("Missing url param");
@@ -1687,12 +1751,18 @@ async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) 
     // Stamp &cdn= so /hls-proxy doesn't depend on hostname allowlists for
     // sources that rotate CDNs (Movy). Child playlist rewrites preserve it.
     const proxied = (s) => {
+      // Nashville is VP9/Opus DASH — Tizen/hls.js can't play it raw. Point at
+      // the dash→hls remux which serves real H.264/AAC HLS.
+      if (s.source === "nashville") {
+        const hash = dashHlsHash(s.url);
+        // Kick remux in the background so the first playlist hit is warmer.
+        ensureDashHls(s.url).catch((err) =>
+          console.warn(`[nashville] remux warm failed: ${err.message}`)
+        );
+        return `${origin}/dash-hls/${hash}/index.m3u8?src=${encodeURIComponent(s.url)}`;
+      }
       const cdn =
-        s.source === "movy" || s.source === "nashville"
-          ? "&cdn=movy"
-          : s.source === "catflix"
-          ? "&cdn=catflix"
-          : "";
+        s.source === "movy" ? "&cdn=movy" : s.source === "catflix" ? "&cdn=catflix" : "";
       return `${origin}/hls-proxy?url=${encodeURIComponent(s.url)}${cdn}`;
     };
     const proxiedHlsUrl = best ? proxied(best) : null;
