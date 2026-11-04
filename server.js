@@ -27,6 +27,12 @@ import { registerSyncRoutes, requireAuth, requirePremium } from "./srctvSync.js"
 import { fetchCatflixStream, fetchFlixhqStreams, fetchOphimStreams } from "./utils/catflix.js";
 import { fetchMovyStreams, NASHVILLE_CITY } from "./utils/wecollege.js";
 import { ensureDashHls, dashHlsHash, readDashHlsFile } from "./utils/dashHls.js";
+import {
+  ensureFmp4Hls,
+  fmp4HlsHash,
+  readFmp4HlsFile,
+  sanitizeTizenPlaylist,
+} from "./utils/fmp4Hls.js";
 import { Readable } from "stream";
 import fs, { readFileSync } from "fs";
 import http from "http";
@@ -60,7 +66,10 @@ const globalLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests, please slow down" },
-  skip: (req) => req.path === "/hls-proxy",
+  skip: (req) =>
+    req.path === "/hls-proxy" ||
+    req.path.startsWith("/dash-hls/") ||
+    req.path.startsWith("/ts-hls/"),
 });
 const extractLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -1237,8 +1246,8 @@ async function* resumeStream(head, iterator, done) {
 // segment sits in kernel socket buffers (CLOSE_WAIT) plus node's stream
 // buffers — about 1-10 MB per zombie — until the process restarts. That is
 // exactly how a 1 GB host ends up swapped out after a couple of days.
-// Nashville DASH → HLS remux. Playlist waits for the first ffmpeg segment;
-// subsequent segment requests are served from /tmp cache.
+// Nashville DASH → HLS remux. Playlist waits for an adaptive pre-buffer so
+// Tizen cannot outrun a sub-realtime VP9→H.264 encode on this droplet.
 app.get("/dash-hls/:hash/:file", async (req, res) => {
   const src = typeof req.query.src === "string" ? req.query.src : "";
   const file = String(req.params.file || "");
@@ -1253,7 +1262,7 @@ app.get("/dash-hls/:hash/:file", async (req, res) => {
       await ensureDashHls(src);
       const full = readDashHlsFile(src, "index.m3u8");
       if (!full) return res.status(502).send("Remux not ready");
-      let text = fs.readFileSync(full, "utf8");
+      let text = sanitizeTizenPlaylist(fs.readFileSync(full, "utf8"));
       // Rewrite segment URIs so they keep ?src= for the shared cache key.
       const qs = `?src=${encodeURIComponent(src)}`;
       text = text
@@ -1273,7 +1282,7 @@ app.get("/dash-hls/:hash/:file", async (req, res) => {
       // Playlist may race ahead of a segment on a slow encode — wait briefly.
       const started = Date.now();
       let full = readDashHlsFile(src, file);
-      while (!full && Date.now() - started < 20000) {
+      while (!full && Date.now() - started < 45000) {
         await new Promise((r) => setTimeout(r, 400));
         full = readDashHlsFile(src, file);
       }
@@ -1285,6 +1294,56 @@ app.get("/dash-hls/:hash/:file", async (req, res) => {
     return res.status(404).send("Not found");
   } catch (err) {
     console.error("[dash-hls]", err.message);
+    if (!res.headersSent) res.status(502).send("Remux failed");
+  }
+});
+
+// fMP4 (movy/flixhq/ophim) → MPEG-TS remux for Tizen AVPlay.
+app.get("/ts-hls/:hash/:file", async (req, res) => {
+  const src = typeof req.query.src === "string" ? req.query.src : "";
+  const source = typeof req.query.source === "string" ? req.query.source : "";
+  const file = String(req.params.file || "");
+  if (!src || !/^https?:\/\//i.test(src)) {
+    return res.status(400).send("Missing src");
+  }
+  if (fmp4HlsHash(src) !== req.params.hash) {
+    return res.status(400).send("Hash mismatch");
+  }
+  try {
+    if (/^index\.m3u8$/i.test(file)) {
+      await ensureFmp4Hls(src, source);
+      const full = readFmp4HlsFile(src, "index.m3u8");
+      if (!full) return res.status(502).send("Remux not ready");
+      let text = sanitizeTizenPlaylist(fs.readFileSync(full, "utf8"));
+      const qs = `?src=${encodeURIComponent(src)}&source=${encodeURIComponent(source)}`;
+      text = text
+        .split("\n")
+        .map((line) => {
+          const t = line.trim();
+          if (!t || t.startsWith("#")) return line;
+          if (/^seg_\d+\.ts$/i.test(t)) return `${t}${qs}`;
+          return line;
+        })
+        .join("\n");
+      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+      res.setHeader("Cache-Control", "no-cache");
+      return res.send(text);
+    }
+    if (/^seg_\d+\.ts$/i.test(file)) {
+      const started = Date.now();
+      let full = readFmp4HlsFile(src, file);
+      while (!full && Date.now() - started < 30000) {
+        await new Promise((r) => setTimeout(r, 300));
+        full = readFmp4HlsFile(src, file);
+      }
+      if (!full) return res.status(404).send("Segment not ready");
+      res.setHeader("Content-Type", "video/mp2t");
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      return fs.createReadStream(full).pipe(res);
+    }
+    return res.status(404).send("Not found");
+  } catch (err) {
+    console.error("[ts-hls]", err.message);
     if (!res.headersSent) res.status(502).send("Remux failed");
   }
 });
@@ -1752,7 +1811,7 @@ async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) 
     // sources that rotate CDNs (Movy). Child playlist rewrites preserve it.
     const proxied = (s) => {
       // Nashville is VP9/Opus DASH — Tizen/hls.js can't play it raw. Point at
-      // the dash→hls remux which serves real H.264/AAC HLS.
+      // the dash→hls remux which serves real H.264/MP2 HLS.
       if (s.source === "nashville") {
         const hash = dashHlsHash(s.url);
         // Kick remux in the background so the first playlist hit is warmer.
@@ -1760,6 +1819,15 @@ async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) 
           console.warn(`[nashville] remux warm failed: ${err.message}`)
         );
         return `${origin}/dash-hls/${hash}/index.m3u8?src=${encodeURIComponent(s.url)}`;
+      }
+      // movy/flixhq/ophim are fMP4 (EXT-X-MAP). Tizen AVPlay won't play them
+      // reliably — remux to MPEG-TS via stream copy (~20x realtime).
+      if (s.source === "movy" || s.source === "flixhq" || s.source === "ophim") {
+        const hash = fmp4HlsHash(s.url);
+        ensureFmp4Hls(s.url, s.source).catch((err) =>
+          console.warn(`[${s.source}] ts remux warm failed: ${err.message}`)
+        );
+        return `${origin}/ts-hls/${hash}/index.m3u8?src=${encodeURIComponent(s.url)}&source=${encodeURIComponent(s.source)}`;
       }
       const cdn =
         s.source === "movy" ? "&cdn=movy" : s.source === "catflix" ? "&cdn=catflix" : "";

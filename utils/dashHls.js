@@ -1,6 +1,7 @@
-// Remux Nashville/finalsignal DASH (VP9+Opus WebM) into HLS (H.264+AAC TS)
-// so Tizen / hls.js clients can actually play it. One ffmpeg job per source
-// URL, shared across viewers, cached on disk until idle expiry.
+// Remux Nashville/finalsignal DASH (VP9+Opus WebM) into HLS (H.264+MP2 TS)
+// so Tizen / hls.js clients can play it. Encode on a 1GB droplet is often
+// slightly under realtime — we measure early speed and wait for a buffer
+// large enough that playback cannot outrun the remux before ENDLIST.
 import { spawn } from "child_process";
 import crypto from "crypto";
 import fs from "fs";
@@ -8,9 +9,14 @@ import path from "path";
 
 const ROOT = process.env.DASH_HLS_CACHE || "/tmp/srctv-dashhls";
 const IDLE_MS = 1000 * 60 * 90;
-const READY_TIMEOUT_MS = 1000 * 90;
+/** Hard cap waiting for the adaptive pre-buffer before first playlist. */
+const READY_TIMEOUT_MS = 1000 * 60 * 12;
+const SPEED_SAMPLE_MS = 1000 * 45;
+const SAFETY = 1.3;
+const MIN_BUFFER_SEC = 120;
+const MAX_BUFFER_SEC = 900;
 
-/** @type {Map<string, { child: import('child_process').ChildProcess|null, dir: string, playlist: string, ready: Promise<string>, lastUsed: number, failed?: string, expectedSec?: number }>} */
+/** @type {Map<string, { child: import('child_process').ChildProcess|null, dir: string, playlist: string, ready: Promise<string>, lastUsed: number, failed?: string, expectedSec?: number, startedAt?: number }>} */
 const jobs = new Map();
 
 function hashUrl(url) {
@@ -46,8 +52,6 @@ function isRemuxComplete(playlistPath, expectedSec) {
   if (!fs.existsSync(playlistPath) || !playlistHasEnd(playlistPath)) return false;
   const dur = playlistDurationSec(playlistPath);
   if (expectedSec && expectedSec > 30) return dur >= expectedSec * 0.9;
-  // Without an MPD duration, demand at least 2 minutes so a 30s stall
-  // isn't treated as a finished episode.
   return dur >= 120;
 }
 
@@ -66,7 +70,6 @@ async function fetchMpdDurationSec(mpdUrl) {
     const text = await res.text();
     const raw = (text.match(/mediaPresentationDuration="([^"]+)"/i) || [])[1];
     if (!raw) return null;
-    // PT2725.499023S or PT1H5M25.5S
     const h = /([\d.]+)H/i.exec(raw);
     const m = /([\d.]+)M/i.exec(raw);
     const s = /([\d.]+)S/i.exec(raw);
@@ -80,30 +83,17 @@ async function fetchMpdDurationSec(mpdUrl) {
   }
 }
 
-function fileReady(file, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const start = Date.now();
-    const tick = () => {
-      try {
-        if (fs.existsSync(file) && fs.statSync(file).size > 32) {
-          const dir = path.dirname(file);
-          const segs = fs.readdirSync(dir).filter((f) => /\.ts$/i.test(f));
-          if (segs.length >= 1) return resolve(file);
-        }
-      } catch {}
-      if (Date.now() - start > timeoutMs) {
-        return reject(new Error("dash→hls remux timed out waiting for playlist"));
-      }
-      setTimeout(tick, 500);
-    };
-    tick();
-  });
+function clearDir(dir) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {}
+  fs.mkdirSync(dir, { recursive: true });
 }
 
 function buildFfmpegArgs(mpdUrl, dir, playlist) {
-  // Prefer 720p to keep a 1GB droplet alive; ultrafast for startup latency.
-  // Use -referer (not -headers): broken CR/LF headers made finalsignal EOF
-  // after ~30s and ffmpeg wrote a truncated playlist with ENDLIST.
+  // 480p@24 + MP2 mono: AAC encode was the bottleneck (~0.4x). MP2 in
+  // MPEG-TS is Tizen/DVB-native and leaves CPU for VP9→H.264 (~0.9x+).
+  // No PLAYLIST-TYPE:EVENT / INDEPENDENT-SEGMENTS — both break AVPlay refresh.
   return [
     "-hide_banner",
     "-loglevel",
@@ -123,43 +113,95 @@ function buildFfmpegArgs(mpdUrl, dir, playlist) {
     "libx264",
     "-preset",
     "ultrafast",
-    "-crf",
-    "28",
-    "-vf",
-    "scale=-2:'min(720,ih)'",
-    "-c:a",
-    "aac",
-    "-ac",
+    "-threads",
     "2",
+    "-crf",
+    "32",
+    "-vf",
+    "scale=-2:480,fps=24",
+    "-g",
+    "48",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "mp2",
+    "-ac",
+    "1",
+    "-ar",
+    "22050",
     "-b:a",
-    "128k",
+    "64k",
     "-f",
     "hls",
     "-hls_time",
-    "4",
-    "-hls_playlist_type",
-    "event",
+    "6",
     "-hls_list_size",
     "0",
     "-hls_flags",
-    "independent_segments",
+    "omit_endlist",
     "-hls_segment_filename",
     path.join(dir, "seg_%04d.ts"),
     playlist,
   ];
 }
 
-function clearDir(dir) {
-  try {
-    fs.rmSync(dir, { recursive: true, force: true });
-  } catch {}
-  fs.mkdirSync(dir, { recursive: true });
+/**
+ * Required head-start so playback of `expectedSec` at 1x never outruns
+ * an encoder running at `speed` (content-sec per wall-sec).
+ * B >= E * (1 - r) * safety, clamped.
+ */
+function requiredBufferSec(expectedSec, speed) {
+  const r = Math.max(0.05, Math.min(speed, 2));
+  if (r >= 1.05) return MIN_BUFFER_SEC;
+  const episode = expectedSec && expectedSec > 60 ? expectedSec : 2700;
+  const need = episode * (1 - r) * SAFETY + 45;
+  return Math.max(MIN_BUFFER_SEC, Math.min(MAX_BUFFER_SEC, need));
+}
+
+function waitUntilBuffered(playlist, expectedSec, startedAt, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    let target = MIN_BUFFER_SEC;
+    let sampled = false;
+
+    const tick = () => {
+      try {
+        if (isRemuxComplete(playlist, expectedSec)) return resolve(playlist);
+        const dur = playlistDurationSec(playlist);
+        const wall = (Date.now() - startedAt) / 1000;
+        if (!sampled && wall >= SPEED_SAMPLE_MS / 1000 && dur > 5) {
+          const speed = dur / wall;
+          target = requiredBufferSec(expectedSec, speed);
+          sampled = true;
+          console.log(
+            `[dash-hls] speed=${speed.toFixed(2)}x → prebuffer ${target.toFixed(0)}s` +
+              (expectedSec ? ` (episode ~${expectedSec.toFixed(0)}s)` : "")
+          );
+        }
+        const segs = fs.existsSync(path.dirname(playlist))
+          ? fs.readdirSync(path.dirname(playlist)).filter((f) => /\.ts$/i.test(f)).length
+          : 0;
+        if (segs >= 2 && dur >= target) return resolve(playlist);
+      } catch {}
+      if (Date.now() > deadline) {
+        const dur = playlistDurationSec(playlist);
+        if (dur >= MIN_BUFFER_SEC) {
+          console.warn(
+            `[dash-hls] prebuffer timeout with ${dur.toFixed(0)}s (wanted ${target.toFixed(0)}s) — serving anyway`
+          );
+          return resolve(playlist);
+        }
+        return reject(new Error("dash→hls remux timed out waiting for prebuffer"));
+      }
+      setTimeout(tick, 800);
+    };
+    tick();
+  });
 }
 
 /**
- * Start (or reuse) an ffmpeg remux for this MPD. Resolves with the absolute
- * path to index.m3u8 once the first segment is on disk. Keeps encoding in
- * the background until the full episode is written.
+ * Start (or reuse) an ffmpeg remux for this MPD. Resolves once the adaptive
+ * pre-buffer is on disk so Tizen cannot outrun the encoder.
  */
 export async function ensureDashHls(mpdUrl) {
   const key = hashUrl(mpdUrl);
@@ -172,14 +214,11 @@ export async function ensureDashHls(mpdUrl) {
     job = null;
   }
 
-  // Already started (encoding or complete) — reuse the same promise so
-  // extract warm + /dash-hls hit don't spawn two ffmpegs into one dir.
   if (job?.ready) {
     job.lastUsed = Date.now();
     return job.ready;
   }
 
-  // Reserve the slot synchronously before any await (MPD duration fetch).
   let resolveReady;
   let rejectReady;
   const ready = new Promise((resolve, reject) => {
@@ -217,6 +256,8 @@ export async function ensureDashHls(mpdUrl) {
         fs.mkdirSync(dir, { recursive: true });
       }
 
+      const startedAt = Date.now();
+      job.startedAt = startedAt;
       const child = spawn("ffmpeg", buildFfmpegArgs(mpdUrl, dir, playlist), {
         stdio: ["ignore", "ignore", "pipe"],
       });
@@ -232,28 +273,34 @@ export async function ensureDashHls(mpdUrl) {
         cur.child = null;
         const dur = playlistDurationSec(playlist);
         const complete = isRemuxComplete(playlist, cur.expectedSec);
-        if (code && code !== 0 && !complete) {
+        if (fs.existsSync(playlist) && !playlistHasEnd(playlist) && dur >= 60) {
+          // Only finalize ENDLIST when we actually finished (or got enough).
+          if (complete || (cur.expectedSec && dur >= cur.expectedSec * 0.9)) {
+            try {
+              fs.appendFileSync(playlist, "\n#EXT-X-ENDLIST\n");
+            } catch {}
+          }
+        }
+        if (code && code !== 0 && !isRemuxComplete(playlist, cur.expectedSec)) {
           cur.failed = `ffmpeg exited ${code} after ${dur.toFixed(0)}s: ${stderr.trim()}`;
           console.error(`[dash-hls] ${cur.failed}`);
           return;
         }
-        if (complete && fs.existsSync(playlist) && !playlistHasEnd(playlist)) {
-          try {
-            fs.appendFileSync(playlist, "\n#EXT-X-ENDLIST\n");
-          } catch {}
-        }
-        if (!complete) {
-          cur.failed =
-            `ffmpeg ended early after ${dur.toFixed(0)}s` +
-            (cur.expectedSec ? ` (expected ~${cur.expectedSec.toFixed(0)}s)` : "") +
-            (stderr ? `: ${stderr.trim()}` : "");
-          console.error(`[dash-hls] ${cur.failed}`);
+        if (!isRemuxComplete(playlist, cur.expectedSec)) {
+          // Encoder died early without ENDLIST — mark failed so next hit restarts.
+          if (dur < (cur.expectedSec || 120) * 0.9) {
+            cur.failed =
+              `ffmpeg ended early after ${dur.toFixed(0)}s` +
+              (cur.expectedSec ? ` (expected ~${cur.expectedSec.toFixed(0)}s)` : "") +
+              (stderr ? `: ${stderr.trim()}` : "");
+            console.error(`[dash-hls] ${cur.failed}`);
+          }
         } else {
           console.log(`[dash-hls] remux complete ${key}: ${dur.toFixed(0)}s`);
         }
       });
 
-      await fileReady(playlist, READY_TIMEOUT_MS);
+      await waitUntilBuffered(playlist, expectedSec, startedAt, READY_TIMEOUT_MS);
       resolveReady(playlist);
     } catch (err) {
       try {
@@ -278,7 +325,6 @@ export function readDashHlsFile(mpdUrl, name) {
   return full;
 }
 
-// Drop idle remux dirs so /tmp doesn't fill up.
 setInterval(() => {
   const now = Date.now();
   for (const [key, job] of jobs) {
