@@ -26,13 +26,12 @@ import {
 import { registerSyncRoutes, requireAuth, requirePremium } from "./srctvSync.js";
 import { fetchCatflixStream, fetchFlixhqStreams, fetchOphimStreams } from "./utils/catflix.js";
 import { fetchMovyStreams, NASHVILLE_CITY } from "./utils/wecollege.js";
-import { ensureDashHls, dashHlsHash, readDashHlsFile } from "./utils/dashHls.js";
 import {
-  ensureFmp4Hls,
-  fmp4HlsHash,
-  readFmp4HlsFile,
+  ensureDashHls,
+  dashHlsHash,
+  readDashHlsFile,
   sanitizeTizenPlaylist,
-} from "./utils/fmp4Hls.js";
+} from "./utils/dashHls.js";
 import { Readable } from "stream";
 import fs, { readFileSync } from "fs";
 import http from "http";
@@ -66,10 +65,7 @@ const globalLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests, please slow down" },
-  skip: (req) =>
-    req.path === "/hls-proxy" ||
-    req.path.startsWith("/dash-hls/") ||
-    req.path.startsWith("/ts-hls/"),
+  skip: (req) => req.path === "/hls-proxy" || req.path.startsWith("/dash-hls/"),
 });
 const extractLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -429,32 +425,6 @@ function qualityTier({ width, height }) {
 function qualityLabel(res) {
   const tier = qualityTier(res);
   return tier ? `${tier}p` : null;
-}
-
-// Tizen remux: prefer ≤1080p of the same source so we don't burn the
-// droplet's NIC/CPU copying 2160p while Nashville needs the cores.
-function streamHeight(s) {
-  return (
-    qualityTier(s) ||
-    Number(s.height) ||
-    claimedQualityDims(s.quality)?.height ||
-    0
-  );
-}
-function pickFmp4ForTizen(s, all) {
-  if (!s || !["movy", "flixhq", "ophim"].includes(s.source)) return s;
-  const same = (all || []).filter((x) => x.source === s.source && x.url);
-  if (same.length <= 1) return s;
-  const scored = same
-    .map((x) => ({ x, h: streamHeight(x) }))
-    .filter((t) => t.h > 0);
-  if (!scored.length) return s;
-  const hd = scored
-    .filter((t) => t.h >= 720 && t.h <= 1080)
-    .sort((a, b) => b.h - a.h)[0];
-  if (hd) return hd.x;
-  const below = scored.filter((t) => t.h <= 1080).sort((a, b) => b.h - a.h)[0];
-  return below?.x || s;
 }
 
 // Movy city payloads label streams "2160p"/"1080p"/"Auto" even when the
@@ -1341,56 +1311,6 @@ app.get("/dash-hls/:hash/:file", async (req, res) => {
   }
 });
 
-// fMP4 (movy/flixhq/ophim) → MPEG-TS remux for Tizen AVPlay.
-app.get("/ts-hls/:hash/:file", async (req, res) => {
-  const src = typeof req.query.src === "string" ? req.query.src : "";
-  const source = typeof req.query.source === "string" ? req.query.source : "";
-  const file = String(req.params.file || "");
-  if (!src || !/^https?:\/\//i.test(src)) {
-    return res.status(400).send("Missing src");
-  }
-  if (fmp4HlsHash(src) !== req.params.hash) {
-    return res.status(400).send("Hash mismatch");
-  }
-  try {
-    if (/^index\.m3u8$/i.test(file)) {
-      await ensureFmp4Hls(src, source);
-      const full = readFmp4HlsFile(src, "index.m3u8");
-      if (!full) return res.status(502).send("Remux not ready");
-      let text = sanitizeTizenPlaylist(fs.readFileSync(full, "utf8"));
-      const qs = `?src=${encodeURIComponent(src)}&source=${encodeURIComponent(source)}`;
-      text = text
-        .split("\n")
-        .map((line) => {
-          const t = line.trim();
-          if (!t || t.startsWith("#")) return line;
-          if (/^seg_\d+\.ts$/i.test(t)) return `${t}${qs}`;
-          return line;
-        })
-        .join("\n");
-      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-      res.setHeader("Cache-Control", "no-cache");
-      return res.send(text);
-    }
-    if (/^seg_\d+\.ts$/i.test(file)) {
-      const started = Date.now();
-      let full = readFmp4HlsFile(src, file);
-      while (!full && Date.now() - started < 30000) {
-        await new Promise((r) => setTimeout(r, 300));
-        full = readFmp4HlsFile(src, file);
-      }
-      if (!full) return res.status(404).send("Segment not ready");
-      res.setHeader("Content-Type", "video/mp2t");
-      res.setHeader("Cache-Control", "public, max-age=3600");
-      return fs.createReadStream(full).pipe(res);
-    }
-    return res.status(404).send("Not found");
-  } catch (err) {
-    console.error("[ts-hls]", err.message);
-    if (!res.headersSent) res.status(502).send("Remux failed");
-  }
-});
-
 app.get("/hls-proxy", async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).send("Missing url param");
@@ -1864,18 +1784,6 @@ async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) 
         }
         return `${origin}/dash-hls/${hash}/index.m3u8?src=${encodeURIComponent(s.url)}`;
       }
-      // movy/flixhq/ophim are fMP4 (EXT-X-MAP). Tizen AVPlay won't play them
-      // reliably — remux to MPEG-TS via stream copy (~20x realtime).
-      if (s.source === "movy" || s.source === "flixhq" || s.source === "ophim") {
-        const pick = pickFmp4ForTizen(s, uniqueStreams);
-        const hash = fmp4HlsHash(pick.url);
-        if (warm) {
-          ensureFmp4Hls(pick.url, pick.source).catch((err) =>
-            console.warn(`[${pick.source}] ts remux warm failed: ${err.message}`)
-          );
-        }
-        return `${origin}/ts-hls/${hash}/index.m3u8?src=${encodeURIComponent(pick.url)}&source=${encodeURIComponent(pick.source)}`;
-      }
       const cdn =
         s.source === "movy" ? "&cdn=movy" : s.source === "catflix" ? "&cdn=catflix" : "";
       return `${origin}/hls-proxy?url=${encodeURIComponent(s.url)}${cdn}`;
@@ -1883,8 +1791,7 @@ async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) 
     const proxiedHlsUrl = best ? proxied(best, { warm: true }) : null;
     // One entry per source+quality. Movy only keeps 1080p/2160p; other
     // sources usually expose a single master. hls_url is mirrors[0] unless
-    // ?source= pins another source. Only warm the chosen best — remuxing
-    // every mirror at once starves Nashville on a 1GB droplet.
+    // ?source= pins another source.
     const mirrors = [];
     for (const s of uniqueStreams) {
       const quality = qualityLabel(s);

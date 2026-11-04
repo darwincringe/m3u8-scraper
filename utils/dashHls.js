@@ -28,6 +28,19 @@ export function dashHlsHash(url) {
   return hashUrl(url);
 }
 
+/** Strip tags Tizen AVPlay often chokes on. */
+export function sanitizeTizenPlaylist(text) {
+  return text
+    .split("\n")
+    .filter((line) => {
+      const t = line.trim();
+      if (/^#EXT-X-PLAYLIST-TYPE:/i.test(t)) return false;
+      if (/^#EXT-X-INDEPENDENT-SEGMENTS/i.test(t)) return false;
+      return true;
+    })
+    .join("\n");
+}
+
 export function dashHlsDir(url) {
   return path.join(ROOT, hashUrl(url));
 }
