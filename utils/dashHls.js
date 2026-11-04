@@ -172,98 +172,97 @@ export async function ensureDashHls(mpdUrl) {
     job = null;
   }
 
-  // Still encoding — just wait for first segment (or reuse ready promise).
-  if (job?.child && !job.child.killed) {
+  // Already started (encoding or complete) — reuse the same promise so
+  // extract warm + /dash-hls hit don't spawn two ffmpegs into one dir.
+  if (job?.ready) {
     job.lastUsed = Date.now();
     return job.ready;
   }
 
-  const expectedSec = job?.expectedSec ?? (await fetchMpdDurationSec(mpdUrl));
-
-  // Finished remux on disk — serve it.
-  if (isRemuxComplete(playlist, expectedSec)) {
-    const ready = Promise.resolve(playlist);
-    jobs.set(key, {
-      child: null,
-      dir,
-      playlist,
-      ready,
-      lastUsed: Date.now(),
-      expectedSec: expectedSec || undefined,
-    });
-    return ready;
-  }
-
-  // Truncated leftover (the ~30s ENDLIST bug) or orphan segs — start clean.
-  if (fs.existsSync(dir)) {
-    const dur = playlistDurationSec(playlist);
-    console.warn(
-      `[dash-hls] restarting remux ${key} (had ${dur.toFixed(0)}s` +
-        (expectedSec ? `/${expectedSec.toFixed(0)}s` : "") +
-        `, endlist=${playlistHasEnd(playlist)})`
-    );
-    clearDir(dir);
-  } else {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-
-  const child = spawn("ffmpeg", buildFfmpegArgs(mpdUrl, dir, playlist), {
-    stdio: ["ignore", "ignore", "pipe"],
+  // Reserve the slot synchronously before any await (MPD duration fetch).
+  let resolveReady;
+  let rejectReady;
+  const ready = new Promise((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
   });
-  let stderr = "";
-  child.stderr?.on("data", (chunk) => {
-    stderr = (stderr + chunk.toString("utf8")).slice(-2000);
-  });
-
-  const ready = fileReady(playlist, READY_TIMEOUT_MS).catch((err) => {
-    try {
-      child.kill("SIGKILL");
-    } catch {}
-    const wrapped = new Error(err.message + (stderr ? `: ${stderr.trim()}` : ""));
-    const cur = jobs.get(key);
-    if (cur) cur.failed = wrapped.message;
-    throw wrapped;
-  });
-
   job = {
-    child,
+    child: null,
     dir,
     playlist,
     ready,
     lastUsed: Date.now(),
-    expectedSec: expectedSec || undefined,
   };
   jobs.set(key, job);
 
-  child.on("exit", (code) => {
-    const cur = jobs.get(key);
-    if (!cur) return;
-    cur.child = null;
-    const dur = playlistDurationSec(playlist);
-    const complete = isRemuxComplete(playlist, cur.expectedSec);
-    if (code && code !== 0 && !complete) {
-      cur.failed = `ffmpeg exited ${code} after ${dur.toFixed(0)}s: ${stderr.trim()}`;
-      console.error(`[dash-hls] ${cur.failed}`);
-      return;
-    }
-    // Ensure players stop cleanly at the real end.
-    if (complete && fs.existsSync(playlist) && !playlistHasEnd(playlist)) {
+  (async () => {
+    try {
+      const expectedSec = await fetchMpdDurationSec(mpdUrl);
+      job.expectedSec = expectedSec || undefined;
+
+      if (isRemuxComplete(playlist, expectedSec)) {
+        resolveReady(playlist);
+        return;
+      }
+
+      if (fs.existsSync(dir)) {
+        const dur = playlistDurationSec(playlist);
+        console.warn(
+          `[dash-hls] restarting remux ${key} (had ${dur.toFixed(0)}s` +
+            (expectedSec ? `/${expectedSec.toFixed(0)}s` : "") +
+            `, endlist=${playlistHasEnd(playlist)})`
+        );
+        clearDir(dir);
+      } else {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+
+      const child = spawn("ffmpeg", buildFfmpegArgs(mpdUrl, dir, playlist), {
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      job.child = child;
+      let stderr = "";
+      child.stderr?.on("data", (chunk) => {
+        stderr = (stderr + chunk.toString("utf8")).slice(-2000);
+      });
+
+      child.on("exit", (code) => {
+        const cur = jobs.get(key);
+        if (!cur) return;
+        cur.child = null;
+        const dur = playlistDurationSec(playlist);
+        const complete = isRemuxComplete(playlist, cur.expectedSec);
+        if (code && code !== 0 && !complete) {
+          cur.failed = `ffmpeg exited ${code} after ${dur.toFixed(0)}s: ${stderr.trim()}`;
+          console.error(`[dash-hls] ${cur.failed}`);
+          return;
+        }
+        if (complete && fs.existsSync(playlist) && !playlistHasEnd(playlist)) {
+          try {
+            fs.appendFileSync(playlist, "\n#EXT-X-ENDLIST\n");
+          } catch {}
+        }
+        if (!complete) {
+          cur.failed =
+            `ffmpeg ended early after ${dur.toFixed(0)}s` +
+            (cur.expectedSec ? ` (expected ~${cur.expectedSec.toFixed(0)}s)` : "") +
+            (stderr ? `: ${stderr.trim()}` : "");
+          console.error(`[dash-hls] ${cur.failed}`);
+        } else {
+          console.log(`[dash-hls] remux complete ${key}: ${dur.toFixed(0)}s`);
+        }
+      });
+
+      await fileReady(playlist, READY_TIMEOUT_MS);
+      resolveReady(playlist);
+    } catch (err) {
       try {
-        fs.appendFileSync(playlist, "\n#EXT-X-ENDLIST\n");
+        job.child?.kill("SIGKILL");
       } catch {}
+      job.failed = err?.message || String(err);
+      rejectReady(err);
     }
-    if (!complete) {
-      // Input EOF'd early — mark failed so the next viewer retries instead
-      // of looping a 30s stub forever.
-      cur.failed =
-        `ffmpeg ended early after ${dur.toFixed(0)}s` +
-        (cur.expectedSec ? ` (expected ~${cur.expectedSec.toFixed(0)}s)` : "") +
-        (stderr ? `: ${stderr.trim()}` : "");
-      console.error(`[dash-hls] ${cur.failed}`);
-    } else {
-      console.log(`[dash-hls] remux complete ${key}: ${dur.toFixed(0)}s`);
-    }
-  });
+  })();
 
   return ready;
 }
