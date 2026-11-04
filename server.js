@@ -25,7 +25,7 @@ import {
 } from "./utils/opensubtitles.js";
 import { registerSyncRoutes, requireAuth, requirePremium } from "./srctvSync.js";
 import { fetchCatflixStream, fetchFlixhqStreams, fetchOphimStreams } from "./utils/catflix.js";
-import { fetchMovyStreams } from "./utils/wecollege.js";
+import { fetchMovyStreams, NASHVILLE_CITY } from "./utils/wecollege.js";
 import { Readable } from "stream";
 import { readFileSync } from "fs";
 import http from "http";
@@ -169,7 +169,8 @@ const MOVY_UPSTREAM_HEADERS = {
   Referer: "https://www.movy.sx/",
   Origin: "https://www.movy.sx",
   "User-Agent": BROWSER_UA,
-  Accept: "application/vnd.apple.mpegurl,application/x-mpegURL,*/*",
+  Accept:
+    "application/vnd.apple.mpegurl,application/x-mpegURL,application/dash+xml,application/xml,*/*",
 };
 UPSTREAM_HEADER_RULES.push({
   test: /(^|\.)(finalsignal\.top|goldenkite\.top|pulseatom\.top|wellsrobertsonkmlt\.workers\.dev)$/i,
@@ -211,6 +212,45 @@ function discardBody(res) {
   try {
     res.body?.destroy();
   } catch {}
+}
+
+// Rewrite a DASH MPD so every segment URL goes through /hls-proxy. BaseURL
+// query-param proxies break relative resolution, so SegmentTemplate refs are
+// expanded to absolute CDN URLs and then proxied; BaseURL tags are cleared.
+function rewriteDashMpd(text, playlistUrl, cdnQS = "") {
+  const docUrl = playlistUrl;
+  const baseTags = [...text.matchAll(/<BaseURL>([^<]*)<\/BaseURL>/gi)].map((m) =>
+    m[1].trim()
+  );
+  let segBase = docUrl;
+  try {
+    if (baseTags.length) segBase = new URL(baseTags[0], docUrl).toString();
+  } catch {}
+  if (!/[?/#]$/.test(segBase) && !segBase.endsWith("/")) {
+    // SegmentTemplate paths are relative to the BaseURL directory.
+    try {
+      const u = new URL(segBase);
+      if (!u.pathname.endsWith("/")) {
+        u.pathname = u.pathname.replace(/[^/]+$/, "");
+        segBase = u.toString();
+      }
+    } catch {}
+  }
+  const proxyAbs = (abs) =>
+    `/hls-proxy?url=${encodeURIComponent(abs)}${cdnQS}`;
+  let out = text.replace(/<BaseURL>[^<]*<\/BaseURL>/gi, "");
+  out = out.replace(
+    /\b(initialization|media)="([^"]+)"/gi,
+    (_, attr, ref) => {
+      try {
+        const abs = new URL(ref, segBase).toString();
+        return `${attr}="${proxyAbs(abs)}"`;
+      } catch {
+        return `${attr}="${ref}"`;
+      }
+    }
+  );
+  return out;
 }
 
 // Per-source CDN hints stamped on /hls-proxy URLs by /extract (`&cdn=movy`).
@@ -767,8 +807,15 @@ async function fetchMovyMeta(type, tmdb_id) {
     const res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
     if (!res.ok) return null;
     const j = await res.json();
+    const title = type === "tv" ? j.name || j.original_name : j.title || j.original_title;
+    const originalTitle =
+      type === "tv" ? j.original_name || undefined : j.original_title || undefined;
     const meta = {
-      title: type === "tv" ? j.name || j.original_name : j.title || j.original_title,
+      title,
+      // Nashville (and similar Asian-catalog cities) resolve better with the
+      // original-script title as altTitle — e.g. 烈火如歌 for Flame's Daughter.
+      originalTitle: originalTitle && originalTitle !== title ? originalTitle : undefined,
+      altTitle: originalTitle && originalTitle !== title ? originalTitle : undefined,
       year: Number(
         String(type === "tv" ? j.first_air_date : j.release_date || "").slice(0, 4)
       ) || undefined,
@@ -789,7 +836,7 @@ async function scrapeMovy(type, tmdb_id, season, episode) {
     // Fall back to vaplayer's title/imdb when TMDB is down — enough for most cities.
     if (!meta?.title) return { streams: [], subtitles: [], transient: false };
     // No extract-level budget: wait for the city race. Cache on /extract
-    // makes the next hit cheap.
+    // makes the next hit cheap. Nashville is excluded — see scrapeNashville.
     const result = await fetchMovyStreams(type, tmdb_id, season, episode, meta, 30000);
     // Keep 1080p + 2K/4K only (drop 720/480/360). "Auto"/unlabeled still
     // probed in case the master actually carries 1080+.
@@ -831,6 +878,68 @@ async function scrapeMovy(type, tmdb_id, season, episode) {
   }
 }
 
+// Nashville often serves DASH (MPD) that our HLS-only probePlaylist rejects.
+async function probeManifestAlive(url, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchUpstream(url, { signal: controller.signal, cdnHint: "movy" });
+    if (!res.ok) {
+      discardBody(res);
+      return false;
+    }
+    const { head } = await peekStream(res.body, 96);
+    discardBody(res);
+    const t = head.toString("utf8").trimStart();
+    return (
+      t.startsWith("#EXTM3U") ||
+      t.startsWith("<?xml") ||
+      /^<MPD[\s>]/i.test(t)
+    );
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Last-resort Movy city. Nashville often finds Asian dramas other extractors
+// miss, but returns finalsignal DASH labeled "Auto" — fine when nothing else
+// works, bad as a default ahead of vaplayer/HLS cities.
+async function scrapeNashville(type, tmdb_id, season, episode) {
+  try {
+    const meta = await fetchMovyMeta(type, tmdb_id);
+    if (!meta?.title) return { streams: [], subtitles: [], transient: false };
+    const result = await fetchMovyStreams(type, tmdb_id, season, episode, meta, 25000, {
+      cities: [NASHVILLE_CITY],
+    });
+    const candidates = (result?.streams || [])
+      .filter((s) => s?.url && !/\.json(\?|$)/i.test(s.url))
+      .slice(0, 4);
+    if (!candidates.length) return { streams: [], subtitles: [], transient: false };
+
+    const alive = await Promise.all(
+      candidates.map(async (s) => ((await probeManifestAlive(s.url)) ? s : null))
+    );
+    const streams = alive
+      .filter(Boolean)
+      .map((s) => ({
+        url: s.url,
+        source: "nashville",
+        // No HLS RESOLUTION on DASH "Auto" — claim 1080 so mirrors aren't null.
+        width: 1920,
+        height: 1080,
+        pixels: 1920 * 1080,
+      }));
+    if (!streams.length) console.warn(`[nashville] no usable stream for ${type} ${tmdb_id}`);
+    else console.log(`[nashville] fallback hit ${type} ${tmdb_id}: ${streams.length} stream(s)`);
+    return { streams, subtitles: [], transient: streams.length === 0 };
+  } catch (error) {
+    console.error(`[nashville] ${error.message}`);
+    return { streams: [], subtitles: [], transient: true };
+  }
+}
+
 // Merge every reachable stream from all sources, ordered by source
 // priority, then by highest working tier within a source. vaplayer is the
 // default: it has an entry for nearly everything and its CDN is
@@ -841,7 +950,15 @@ async function scrapeMovy(type, tmdb_id, season, episode) {
 // CDN stalls at random. ophim: same speed class as flixhq, same upstream
 // family, slightly less coverage. Every source with a working stream is
 // exposed in `mirrors` for the picker / ?source=.
-const SOURCE_PRIORITY = { vaplayer: 0, movy: 1, flixhq: 2, catflix: 3, ophim: 4 };
+const SOURCE_PRIORITY = {
+  vaplayer: 0,
+  movy: 1,
+  flixhq: 2,
+  catflix: 3,
+  ophim: 4,
+  // Only injected when every other source missed (see scrapeNashville).
+  nashville: 5,
+};
 
 // Re-point a finished /extract response at one specific source (the
 // ?source= pin). `mirrors` is left intact so the client still sees every
@@ -1045,6 +1162,13 @@ function findTsSyncOffset(buf) {
 // type is one of a handful of four-letter codes.
 const isFmp4Head = (buf) =>
   buf.length >= 8 && /^(ftyp|styp|moof|moov|sidx|free|skip|emsg|prft)$/.test(buf.toString("latin1", 4, 8));
+// WebM/Matroska (Nashville DASH audio/video fragments on finalsignal).
+const isWebmHead = (buf) =>
+  buf.length >= 4 &&
+  buf[0] === 0x1a &&
+  buf[1] === 0x45 &&
+  buf[2] === 0xdf &&
+  buf[3] === 0xa3;
 
 // Pull at least minBytes off the front of a Readable so we can sniff the
 // payload before deciding how to serve it, and hand back an iterator that
@@ -1132,7 +1256,22 @@ app.get("/hls-proxy", async (req, res) => {
       return;
     }
 
-    const isPlaylist = head.toString("utf8", 0, 16).trimStart().startsWith("#EXTM3U");
+    const headText = head.toString("utf8", 0, 96).trimStart();
+    const isPlaylist = headText.startsWith("#EXTM3U");
+    const isDash =
+      headText.startsWith("<?xml") || /^<MPD[\s>]/i.test(headText);
+
+    // Nashville / finalsignal often returns DASH (MPD) with a .m3u8 suffix.
+    // Rewrite BaseURL + SegmentTemplate URLs through this proxy so a
+    // DASH-capable client can fetch init/media segments with the right Referer.
+    if (isDash) {
+      const rest = [];
+      for await (const chunk of resumeStream(Buffer.alloc(0), iterator, done)) rest.push(chunk);
+      const text = Buffer.concat([head, ...rest]).toString("utf8");
+      const rewritten = rewriteDashMpd(text, target, cdnQS);
+      res.setHeader("Content-Type", "application/dash+xml");
+      return res.send(rewritten);
+    }
 
     // Playlists are small and must be buffered so their segment URLs can be
     // rewritten to point back at this proxy.
@@ -1228,11 +1367,15 @@ app.get("/hls-proxy", async (req, res) => {
     // since a stray 0x47 inside a fragment is not a TS packet — and must
     // not be labelled as MPEG-TS or ExoPlayer/Safari pick the wrong demuxer.
     const isFmp4 = isFmp4Head(head);
-    const syncOffset = isFmp4 ? -1 : findTsSyncOffset(head);
+    const isWebm = isWebmHead(head);
+    const syncOffset = isFmp4 || isWebm ? -1 : findTsSyncOffset(head);
     const skip = syncOffset > 0 ? syncOffset : 0;
     const segmentHead = skip ? head.subarray(skip) : head;
 
-    res.setHeader("Content-Type", isFmp4 ? "video/mp4" : "video/mp2t");
+    res.setHeader(
+      "Content-Type",
+      isFmp4 ? "video/mp4" : isWebm ? "video/webm" : "video/mp2t"
+    );
     const contentLength = parseInt(upstream.headers.get("content-length") || "", 10);
     if (Number.isFinite(contentLength) && contentLength >= skip) {
       res.setHeader("Content-Length", String(contentLength - skip));
@@ -1510,17 +1653,28 @@ async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) 
 
     const vapStreams = vapUntrusted ? [] : result.streams;
     const demotedVap = vapUntrusted ? result.streams : [];
-    const streams = [
+    let streams = [
       ...rankStreams(vapStreams, movy.streams, catflix.streams, flixhq.streams, ophim.streams),
       ...demotedVap.map((s) => ({ ...s, source: "vaplayer" })),
     ];
     // Deduplicate URLs if demotion somehow double-counted (shouldn't).
     const seenUrls = new Set();
-    const uniqueStreams = streams.filter((s) => {
+    let uniqueStreams = streams.filter((s) => {
       if (seenUrls.has(s.url)) return false;
       seenUrls.add(s.url);
       return true;
     });
+
+    // Nashville last-resort: only when vaplayer/movy/flixhq/catflix/ophim all
+    // missed. Keeps DASH/Auto out of the normal picker.
+    if (!uniqueStreams.length) {
+      const nashville = await scrapeNashville(type, tmdb_id, season, episode);
+      if (nashville.streams?.length) {
+        streams = rankStreams(nashville.streams);
+        uniqueStreams = streams;
+      }
+    }
+
     const best = uniqueStreams[0] || null;
     if (best) {
       console.log(
@@ -1534,7 +1688,11 @@ async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) 
     // sources that rotate CDNs (Movy). Child playlist rewrites preserve it.
     const proxied = (s) => {
       const cdn =
-        s.source === "movy" ? "&cdn=movy" : s.source === "catflix" ? "&cdn=catflix" : "";
+        s.source === "movy" || s.source === "nashville"
+          ? "&cdn=movy"
+          : s.source === "catflix"
+          ? "&cdn=catflix"
+          : "";
       return `${origin}/hls-proxy?url=${encodeURIComponent(s.url)}${cdn}`;
     };
     const proxiedHlsUrl = best ? proxied(best) : null;

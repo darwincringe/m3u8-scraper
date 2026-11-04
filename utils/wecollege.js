@@ -13,12 +13,15 @@ const SHA_WORDS = [
 
 // English / original-audio cities Movy lists first. Dubbed cities (munich,
 // berlin, paris, delhi, cancun, austin) are skipped unless we add language UI.
+//
+// Nashville is intentionally NOT in the primary race: it often returns DASH
+// (finalsignal) labeled "Auto", which is a worse default than HLS cities.
+// Callers can request it alone as a last-resort fallback.
 const CITIES = [
   "phoenix",
   "miami",
   "boise",
   "chicago",
-  "nashville",
   "seattle",
   "atlanta",
   "portland",
@@ -26,6 +29,7 @@ const CITIES = [
   "reno",
   "oakland",
 ];
+export const NASHVILLE_CITY = "nashville";
 
 const API_HEADERS = {
   Origin: ORIGIN,
@@ -181,7 +185,15 @@ async function fetchCitySources(city, params, mediaId, seed, timeoutMs) {
  * serve bare media playlists with no RESOLUTION tags, so callers must keep it.
  * `meta` needs { title, year, imdbId, totalSeasons }.
  */
-export async function fetchMovyStreams(type, tmdb_id, season, episode, meta, timeoutMs = 8000) {
+export async function fetchMovyStreams(
+  type,
+  tmdb_id,
+  season,
+  episode,
+  meta,
+  timeoutMs = 8000,
+  { cities = CITIES } = {}
+) {
   if (!meta?.title || !tmdb_id) return null;
   const mediaType = type === "tv" ? "tv" : "movie";
   const params = {
@@ -193,6 +205,9 @@ export async function fetchMovyStreams(type, tmdb_id, season, episode, meta, tim
     seasonId: mediaType === "tv" ? season : 1,
     tmdbId: Number(tmdb_id),
     imdbId: meta.imdbId || undefined,
+    // Chinese / original titles help Nashville (and a few other cities) resolve
+    // Asian dramas that English-only search misses.
+    altTitle: meta.altTitle || meta.originalTitle || undefined,
   };
 
   // Seed is sequential; leave most of the budget for the city race. Under
@@ -201,8 +216,9 @@ export async function fetchMovyStreams(type, tmdb_id, season, episode, meta, tim
   const seed = await fetchSeed(tmdb_id, seedTimeout);
 
   const cityTimeout = Math.max(5000, timeoutMs - seedTimeout);
+  const cityList = Array.isArray(cities) && cities.length ? cities : CITIES;
   const results = await Promise.all(
-    CITIES.map((city) =>
+    cityList.map((city) =>
       fetchCitySources(city, params, tmdb_id, seed, cityTimeout).catch((err) => {
         if (!/no streams|not found|paused|blocked|SEED_INVALID/i.test(err.body || err.message)) {
           // keep noise low — most cities miss on any given title
