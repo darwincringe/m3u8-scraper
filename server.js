@@ -86,16 +86,24 @@ export const COMMON_LANGUAGES = Object.keys(LANGUAGE_NAMES);
 // 10–20s; warm hits should be instant. Source pin (?source=) is applied on
 // the way out so one entry serves every picker variant. Short TTL when a
 // secondary source flaked so the next viewer retries for a better mirror.
+//
+// Soft/stale window: after TTL we still keep the last *successful* answer
+// for a few hours and serve it if a cold re-scrape fails — that stops the
+// "error until I refresh" loop when a CDN/API blips on first play.
 const CACHE_TTL_MS = 1000 * 60 * 15;
 const CACHE_TTL_TRANSIENT_MS = 1000 * 60 * 2;
+const CACHE_STALE_MS = 1000 * 60 * 60 * 6;
 const extractCache = new Map();
 const extractInflight = new Map();
-const cacheEntryExpired = (entry, now = Date.now()) =>
-  now - entry.timestamp >= (entry.ttl ?? CACHE_TTL_MS);
+const extractRevalidating = new Set();
+const cacheEntryFresh = (entry, now = Date.now()) =>
+  now - entry.timestamp < (entry.ttl ?? CACHE_TTL_MS);
+const cacheEntryUsable = (entry, now = Date.now()) =>
+  now - entry.timestamp < CACHE_STALE_MS;
 setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of extractCache) {
-    if (cacheEntryExpired(entry, now)) extractCache.delete(key);
+    if (!cacheEntryUsable(entry, now)) extractCache.delete(key);
   }
 }, 60 * 1000).unref();
 
@@ -105,6 +113,15 @@ function extractCacheKey({ type, tmdb_id, season, episode }) {
     tmdb_id: String(tmdb_id),
     season: season == null || season === "" ? null : String(season),
     episode: episode == null || episode === "" ? null : String(episode),
+  });
+}
+
+function rememberExtractSuccess(cacheKey, response, transient) {
+  if (!response?.success) return;
+  extractCache.set(cacheKey, {
+    timestamp: Date.now(),
+    ttl: transient ? CACHE_TTL_TRANSIENT_MS : CACHE_TTL_MS,
+    response,
   });
 }
 
@@ -828,23 +845,31 @@ const SOURCE_PRIORITY = { vaplayer: 0, movy: 1, flixhq: 2, catflix: 3, ophim: 4 
 
 // Re-point a finished /extract response at one specific source (the
 // ?source= pin). `mirrors` is left intact so the client still sees every
-// option; when the pinned source has no stream for this title the response
-// says so instead of silently handing back another source.
-function applySourceFilter(response, source) {
+// option. If the pin is missing but other mirrors work, fall back to the
+// best available stream instead of hard-failing (CDNs flake; refresh
+// shouldn't be required to play).
+function applySourceFilter(response, source, { allowFallback = true } = {}) {
   if (!source || !response.success) return response;
   // mirrors are quality-ranked; first match is that source's best tier.
   const pick = response.mirrors.find((m) => m.source === source);
-  if (!pick) {
+  if (pick) {
+    return { ...response, hls_url: pick.hls_url, source: pick.source, quality: pick.quality, error: null };
+  }
+  if (allowFallback && response.hls_url && response.mirrors?.length) {
     return {
       ...response,
-      success: false,
-      hls_url: null,
-      source: null,
-      quality: null,
-      error: `No stream from source "${source}" for this title`,
+      error: null,
+      fallback_from: source,
     };
   }
-  return { ...response, hls_url: pick.hls_url, source: pick.source, quality: pick.quality, error: null };
+  return {
+    ...response,
+    success: false,
+    hls_url: null,
+    source: null,
+    quality: null,
+    error: `No stream from source "${source}" for this title`,
+  };
 }
 function rankStreams(...streamLists) {
   // Highest working resolution first; source priority only breaks ties so a
@@ -935,7 +960,7 @@ async function vaplayerPackMismatchesTmdb(extractorSubs, tmdbRefWords) {
 // also gives up on its own if the upstream hasn't produced headers within
 // UPSTREAM_HEADERS_TIMEOUT_MS, so a stalled CDN can't pin a socket open.
 const UPSTREAM_HEADERS_TIMEOUT_MS = 20000;
-async function fetchUpstreamWithRetry(target, attempts = 3, signal, cdnHint) {
+async function fetchUpstreamWithRetry(target, attempts = 4, signal, cdnHint) {
   let lastError;
   let triedMovyFallback = Boolean(cdnHint === "movy");
   for (let i = 0; i < attempts; i++) {
@@ -944,9 +969,11 @@ async function fetchUpstreamWithRetry(target, attempts = 3, signal, cdnHint) {
     const onAbort = () => attempt.abort();
     signal?.addEventListener("abort", onAbort, { once: true });
     const timer = setTimeout(onAbort, UPSTREAM_HEADERS_TIMEOUT_MS);
+    let statusForBackoff = 0;
     try {
       const upstream = await fetchUpstream(target, { signal: attempt.signal, cdnHint });
       if (upstream.ok) return upstream;
+      statusForBackoff = upstream.status;
       // Untagged Movy CDNs often 403 on the vaplayer Referer. One shot with
       // Movy headers recovers rotating hostnames without a deploy.
       if (upstream.status === 403 && !triedMovyFallback) {
@@ -957,6 +984,7 @@ async function fetchUpstreamWithRetry(target, attempts = 3, signal, cdnHint) {
           cdnHint: "movy",
         });
         if (retry.ok) return retry;
+        statusForBackoff = retry.status;
         discardBody(retry);
         lastError = new Error(`Upstream fetch failed with status ${retry.status}`);
       } else {
@@ -970,7 +998,17 @@ async function fetchUpstreamWithRetry(target, attempts = 3, signal, cdnHint) {
       clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
     }
-    if (i < attempts - 1) await new Promise((r) => setTimeout(r, 200 * (i + 1)));
+    if (i < attempts - 1) {
+      // 429/5xx need a longer pause; refresh-on-error was often just waiting
+      // out the CDN rate limit.
+      const delay =
+        statusForBackoff === 429
+          ? 1000 * (i + 1)
+          : statusForBackoff >= 500
+          ? 500 * (i + 1)
+          : 250 * (i + 1);
+      await new Promise((r) => setTimeout(r, delay));
+    }
   }
   throw lastError;
 }
@@ -1082,7 +1120,7 @@ app.get("/hls-proxy", async (req, res) => {
   });
 
   try {
-    upstream = await fetchUpstreamWithRetry(target, 3, client.signal, cdnHint);
+    upstream = await fetchUpstreamWithRetry(target, 5, client.signal, cdnHint);
     if (res.destroyed) {
       discardBody(upstream);
       return;
@@ -1218,7 +1256,19 @@ app.get("/hls-proxy", async (req, res) => {
   } catch (err) {
     if (res.destroyed) return; // client left; nothing to report or send
     console.error("[hls-proxy] Error:", err.message);
-    if (!res.headersSent) res.status(500).send("Proxy error");
+    if (res.headersSent) return;
+    // Surface 429 so players/backoff can retry instead of treating it as a
+    // hard proxy failure (that used to force a full page refresh).
+    const m = /status\s+(\d{3})/.exec(err?.message || "");
+    const status = m ? Number(m[1]) : 500;
+    if (status === 429) {
+      res.setHeader("Retry-After", "2");
+      return res.status(429).send("Upstream rate limited");
+    }
+    if (status >= 500 && status <= 599) {
+      return res.status(502).send("Upstream unavailable");
+    }
+    res.status(500).send("Proxy error");
   }
 });
 
@@ -1266,20 +1316,58 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
   const origin = `${req.protocol}://${req.get("host")}`;
   const cacheKey = extractCacheKey({ type, tmdb_id, season, episode });
   const cached = extractCache.get(cacheKey);
-  if (cached && !cacheEntryExpired(cached)) {
+  const now = Date.now();
+
+  if (cached && cacheEntryFresh(cached, now)) {
     console.log(`[extract] cache hit ${cacheKey}`);
     return res.json(
       applySourceFilter(rehostExtractResponse(cached.response, origin), wantedSource)
     );
   }
 
+  const staleGood =
+    cached && cacheEntryUsable(cached, now) && cached.response?.success
+      ? cached
+      : null;
+
+  // Soft-expired but still usable: kick a background refresh and serve the
+  // last good answer immediately so play never waits on a cold scrape.
+  if (staleGood) {
+    if (!extractRevalidating.has(cacheKey) && !extractInflight.has(cacheKey)) {
+      console.log(`[extract] serving stale + revalidating ${cacheKey}`);
+      extractRevalidating.add(cacheKey);
+      (async () => {
+        try {
+          const result = await buildExtractResponseWithRetry({
+            type,
+            tmdb_id,
+            season,
+            episode,
+            origin,
+          });
+          rememberExtractSuccess(cacheKey, result.response, result.transient);
+        } catch (err) {
+          console.warn(`[extract] revalidate failed ${cacheKey}: ${err.message}`);
+        } finally {
+          extractRevalidating.delete(cacheKey);
+        }
+      })();
+    } else {
+      console.log(`[extract] serving stale (revalidate already running) ${cacheKey}`);
+    }
+    return res.json(
+      applySourceFilter(rehostExtractResponse(staleGood.response, origin), wantedSource)
+    );
+  }
+
   // Coalesce concurrent cold lookups for the same title so Movy's city race
   // only runs once when several viewers hit play together.
   let inflight = extractInflight.get(cacheKey);
+  let joined = false;
   if (!inflight) {
     inflight = (async () => {
       try {
-        return await buildExtractResponse({
+        return await buildExtractResponseWithRetry({
           type,
           tmdb_id,
           season,
@@ -1292,18 +1380,32 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
     })();
     extractInflight.set(cacheKey, inflight);
   } else {
+    joined = true;
     console.log(`[extract] joining inflight ${cacheKey}`);
   }
 
   try {
-    const { response, transient } = await inflight;
-    if (response.success) {
-      extractCache.set(cacheKey, {
-        timestamp: Date.now(),
-        ttl: transient ? CACHE_TTL_TRANSIENT_MS : CACHE_TTL_MS,
-        response,
+    let result;
+    try {
+      result = await inflight;
+    } catch (joinedErr) {
+      // Shared cold scrape failed — don't leave every waiter on a dead
+      // promise. One solo retry recovers the "refresh fixes it" case.
+      if (!joined) throw joinedErr;
+      console.warn(
+        `[extract] inflight failed, solo retry ${cacheKey}: ${joinedErr.message}`
+      );
+      result = await buildExtractResponseWithRetry({
+        type,
+        tmdb_id,
+        season,
+        episode,
+        origin,
       });
     }
+
+    const { response, transient } = result;
+    rememberExtractSuccess(cacheKey, response, transient);
     res.json(applySourceFilter(rehostExtractResponse(response, origin), wantedSource));
   } catch (err) {
     console.error("[extract] Unexpected error:", err.message);
@@ -1316,6 +1418,26 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
     });
   }
 });
+
+async function buildExtractResponseWithRetry(args) {
+  let last;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      last = await buildExtractResponse(args);
+      if (last.response?.success) return last;
+      console.warn(
+        `[extract] attempt ${attempt} returned no streams` +
+          (last.response?.error ? `: ${last.response.error}` : "")
+      );
+    } catch (err) {
+      console.warn(`[extract] attempt ${attempt} threw: ${err.message}`);
+      if (attempt === 2) throw err;
+      last = null;
+    }
+    if (attempt < 2) await new Promise((r) => setTimeout(r, 400 * attempt));
+  }
+  return last ?? { response: { success: false, error: "No streams found", hls_url: null, mirrors: [], subtitles: [] }, transient: true };
+}
 
 async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) {
   try {
