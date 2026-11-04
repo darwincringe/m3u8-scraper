@@ -11,11 +11,11 @@ import { withFfmpegSlot } from "./ffmpegSlot.js";
 const ROOT = process.env.DASH_HLS_CACHE || "/tmp/srctv-dashhls";
 const IDLE_MS = 1000 * 60 * 90;
 /** Hard cap waiting for the adaptive pre-buffer before first playlist. */
-const READY_TIMEOUT_MS = 1000 * 60 * 12;
+const READY_TIMEOUT_MS = 1000 * 60 * 35;
 const SPEED_SAMPLE_MS = 1000 * 45;
-const SAFETY = 1.3;
+const SAFETY = 1.35;
 const MIN_BUFFER_SEC = 180;
-const MAX_BUFFER_SEC = 600;
+const MAX_BUFFER_SEC = 1500;
 
 /** @type {Map<string, { child: import('child_process').ChildProcess|null, dir: string, playlist: string, ready: Promise<string>, lastUsed: number, failed?: string, expectedSec?: number, startedAt?: number }>} */
 const jobs = new Map();
@@ -190,7 +190,21 @@ function waitUntilBuffered(playlist, expectedSec, startedAt, timeoutMs, getFaile
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + timeoutMs;
     let target = MIN_BUFFER_SEC;
-    let sampled = false;
+    let lastSampleWall = 0;
+
+    const retarget = (dur, wall) => {
+      if (wall < SPEED_SAMPLE_MS / 1000 || dur < 5) return;
+      // Re-sample every ~60s — startup is often slower than steady state.
+      if (lastSampleWall && wall - lastSampleWall < 60) return;
+      lastSampleWall = wall;
+      const speed = dur / wall;
+      target = requiredBufferSec(expectedSec, speed);
+      console.log(
+        `[dash-hls] speed=${speed.toFixed(2)}x → prebuffer ${target.toFixed(0)}s` +
+          (expectedSec ? ` (episode ~${expectedSec.toFixed(0)}s)` : "") +
+          ` (have ${dur.toFixed(0)}s)`
+      );
+    };
 
     const tick = () => {
       try {
@@ -202,15 +216,7 @@ function waitUntilBuffered(playlist, expectedSec, startedAt, timeoutMs, getFaile
         }
         const dur = playlistDurationSec(playlist);
         const wall = (Date.now() - startedAt) / 1000;
-        if (!sampled && wall >= SPEED_SAMPLE_MS / 1000 && dur > 5) {
-          const speed = dur / wall;
-          target = requiredBufferSec(expectedSec, speed);
-          sampled = true;
-          console.log(
-            `[dash-hls] speed=${speed.toFixed(2)}x → prebuffer ${target.toFixed(0)}s` +
-              (expectedSec ? ` (episode ~${expectedSec.toFixed(0)}s)` : "")
-          );
-        }
+        retarget(dur, wall);
         const segs = fs.existsSync(path.dirname(playlist))
           ? fs.readdirSync(path.dirname(playlist)).filter((f) => /\.ts$/i.test(f)).length
           : 0;
@@ -292,10 +298,11 @@ export async function ensureDashHls(mpdUrl) {
       const startedAt = Date.now();
       job.startedAt = startedAt;
 
-      // Encode under the global slot for the full job lifetime (so fMP4 copy
-      // remuxes can't steal CPU mid-episode), but resolve ready as soon as
-      // the adaptive pre-buffer is on disk so the player can start.
-      const encodePromise = withFfmpegSlot(async () => {
+      // Hold the global ffmpeg slot only through the pre-buffer window so
+      // VP9→H.264 gets the droplet's CPU while building head-start, then
+      // release so movy/flixhq copy remuxes aren't blocked for the whole
+      // episode. Encode keeps running in the background after ready.
+      await withFfmpegSlot(async () => {
         if (isRemuxComplete(playlist, expectedSec)) return;
 
         const child = spawn("ffmpeg", buildFfmpegArgs(mpdUrl, dir, playlist), {
@@ -307,44 +314,38 @@ export async function ensureDashHls(mpdUrl) {
           stderr = (stderr + chunk.toString("utf8")).slice(-2000);
         });
 
-        await new Promise((resolve) => {
-          child.on("exit", (code) => {
-            const cur = jobs.get(key);
-            if (cur) cur.child = null;
-            const dur = playlistDurationSec(playlist);
-            stripPrematureEndlist(playlist, cur?.expectedSec);
-            const complete = isRemuxComplete(playlist, cur?.expectedSec);
-            if (complete && fs.existsSync(playlist) && !playlistHasEnd(playlist)) {
-              try {
-                fs.appendFileSync(playlist, "\n#EXT-X-ENDLIST\n");
-              } catch {}
-            }
-            if (!complete && dur < (cur?.expectedSec || 120) * 0.9) {
-              const msg =
-                `ffmpeg ended early after ${dur.toFixed(0)}s` +
-                (cur?.expectedSec ? ` (expected ~${cur.expectedSec.toFixed(0)}s)` : "") +
-                (code ? ` (exit ${code})` : "") +
-                (stderr ? `: ${stderr.trim()}` : "");
-              if (cur) cur.failed = msg;
-              console.error(`[dash-hls] ${msg}`);
-            } else if (complete) {
-              console.log(`[dash-hls] remux complete ${key}: ${dur.toFixed(0)}s`);
-            }
-            resolve();
-          });
+        child.on("exit", (code) => {
+          const cur = jobs.get(key);
+          if (cur) cur.child = null;
+          const dur = playlistDurationSec(playlist);
+          stripPrematureEndlist(playlist, cur?.expectedSec);
+          const complete = isRemuxComplete(playlist, cur?.expectedSec);
+          if (complete && fs.existsSync(playlist) && !playlistHasEnd(playlist)) {
+            try {
+              fs.appendFileSync(playlist, "\n#EXT-X-ENDLIST\n");
+            } catch {}
+          }
+          if (!complete && dur < (cur?.expectedSec || 120) * 0.9) {
+            const msg =
+              `ffmpeg ended early after ${dur.toFixed(0)}s` +
+              (cur?.expectedSec ? ` (expected ~${cur.expectedSec.toFixed(0)}s)` : "") +
+              (code ? ` (exit ${code})` : "") +
+              (stderr ? `: ${stderr.trim()}` : "");
+            if (cur) cur.failed = msg;
+            console.error(`[dash-hls] ${msg}`);
+          } else if (complete) {
+            console.log(`[dash-hls] remux complete ${key}: ${dur.toFixed(0)}s`);
+          }
         });
-      });
-      encodePromise.catch((err) => {
-        console.error(`[dash-hls] encode slot error: ${err?.message || err}`);
-      });
 
-      await waitUntilBuffered(
-        playlist,
-        expectedSec,
-        startedAt,
-        READY_TIMEOUT_MS,
-        () => job.failed
-      );
+        await waitUntilBuffered(
+          playlist,
+          expectedSec,
+          startedAt,
+          READY_TIMEOUT_MS,
+          () => job.failed
+        );
+      });
       resolveReady(playlist);
     } catch (err) {
       try {
