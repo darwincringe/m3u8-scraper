@@ -1824,7 +1824,10 @@ async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) 
       catflix.transient ||
       flixhq.transient ||
       ophim.transient ||
-      movy.transient
+      movy.transient ||
+      // Don't pin an empty-sub extract for 15m — Wyzie blips were getting
+      // cached and the player showed "no subtitles" until refresh.
+      (best && (!subtitles || subtitles.length === 0))
     );
     return { response, transient };
   } catch (err) {

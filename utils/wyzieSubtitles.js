@@ -26,7 +26,7 @@ const BROWSER_UA =
 // once and then reused by every other viewer and on back-navigation/rewatch
 // for the rest of the day, keeping us well under the daily limit.
 const SEARCH_TTL_MS = 1000 * 60 * 60 * 24; // 24h
-const SEARCH_TIMEOUT_MS = 6000;
+const SEARCH_TIMEOUT_MS = 12000;
 const searchCache = new Map(); // `${id}:${season}:${episode}` | `${id}:movie` -> { timestamp, candidates }
 
 // Downloads hit opensubtitles.org (not counted against the Wyzie limit), but
@@ -92,23 +92,45 @@ async function searchWyzieCandidates(id, season, episode) {
     `&key=${encodeURIComponent(apiKey)}`;
 
   // Bounded: this runs on every /extract, so a hung Wyzie must not hold
-  // playback start hostage.
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
+  // playback start hostage. One retry on 429/5xx/abort — under load Wyzie
+  // has returned transient 400s that wiped subtitles out of the extract cache.
   let data;
-  try {
-    const res = await fetch(url, {
-      headers: { "User-Agent": BROWSER_UA, Accept: "application/json" },
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      res.body?.destroy?.();
-      throw new Error(`Wyzie search returned ${res.status}`);
+  let lastErr;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, {
+        headers: { "User-Agent": BROWSER_UA, Accept: "application/json" },
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        res.body?.destroy?.();
+        lastErr = new Error(
+          `Wyzie search returned ${res.status}${body ? `: ${body.slice(0, 120)}` : ""}`
+        );
+        if (attempt < 2 && (res.status === 429 || res.status >= 500 || res.status === 400)) {
+          await new Promise((r) => setTimeout(r, 400 * attempt));
+          continue;
+        }
+        throw lastErr;
+      }
+      data = await res.json();
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < 2 && /abort/i.test(err?.message || "")) {
+        await new Promise((r) => setTimeout(r, 400 * attempt));
+        continue;
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeout);
     }
-    data = await res.json();
-  } finally {
-    clearTimeout(timeout);
   }
+  if (lastErr) throw lastErr;
   if (!Array.isArray(data)) throw new Error("Wyzie returned an unexpected payload");
 
   // Anime episodes in particular are often only available in .ass/.ssa on
