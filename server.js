@@ -32,6 +32,14 @@ import {
   readDashHlsFile,
   sanitizeTizenPlaylist,
 } from "./utils/dashHls.js";
+import {
+  loadExtractCache,
+  extractCacheKey,
+  getExtractCache,
+  rememberExtractSuccess,
+  cacheEntryFresh,
+  cacheEntryUsable,
+} from "./utils/extractCache.js";
 import { Readable } from "stream";
 import fs, { readFileSync } from "fs";
 import http from "http";
@@ -88,48 +96,13 @@ export const LANGUAGE_NAMES = {
 
 export const COMMON_LANGUAGES = Object.keys(LANGUAGE_NAMES);
 
-// /extract response cache. Cold scrapes (Movy city race + probes) can take
-// 10–20s; warm hits should be instant. Source pin (?source=) is applied on
-// the way out so one entry serves every picker variant. Short TTL when a
-// secondary source flaked so the next viewer retries for a better mirror.
-//
-// Soft/stale window: after TTL we still keep the last *successful* answer
-// for a few hours and serve it if a cold re-scrape fails — that stops the
-// "error until I refresh" loop when a CDN/API blips on first play.
-const CACHE_TTL_MS = 1000 * 60 * 15;
-const CACHE_TTL_TRANSIENT_MS = 1000 * 60 * 2;
-const CACHE_STALE_MS = 1000 * 60 * 60 * 6;
-const extractCache = new Map();
+// /extract response cache (memory + disk). Cold scrapes can take a while;
+// warm / stale-while-revalidate hits are instant and survive PM2 restarts.
+// Source pin (?source=) is applied on the way out so one entry serves every
+// picker variant. No client/proxy abort should force a second cold scrape.
+loadExtractCache();
 const extractInflight = new Map();
 const extractRevalidating = new Set();
-const cacheEntryFresh = (entry, now = Date.now()) =>
-  now - entry.timestamp < (entry.ttl ?? CACHE_TTL_MS);
-const cacheEntryUsable = (entry, now = Date.now()) =>
-  now - entry.timestamp < CACHE_STALE_MS;
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, entry] of extractCache) {
-    if (!cacheEntryUsable(entry, now)) extractCache.delete(key);
-  }
-}, 60 * 1000).unref();
-
-function extractCacheKey({ type, tmdb_id, season, episode }) {
-  return JSON.stringify({
-    type,
-    tmdb_id: String(tmdb_id),
-    season: season == null || season === "" ? null : String(season),
-    episode: episode == null || episode === "" ? null : String(episode),
-  });
-}
-
-function rememberExtractSuccess(cacheKey, response, transient) {
-  if (!response?.success) return;
-  extractCache.set(cacheKey, {
-    timestamp: Date.now(),
-    ttl: transient ? CACHE_TTL_TRANSIENT_MS : CACHE_TTL_MS,
-    response,
-  });
-}
 
 // Cached responses were built with whatever Host the first request used;
 // rewrite absolute proxy URLs to the current request origin.
@@ -487,9 +460,14 @@ function appendReleaseParam(url) {
   }
 }
 
-async function fetchVaplayerJSON(apiUrl, timeoutMs = 6000) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+async function fetchVaplayerJSON(apiUrl, timeoutMs = 0) {
+  // No abort by default — cancelled mid-scrape left viewers with nothing and
+  // no cache entry. timeoutMs > 0 still supported for optional callers.
+  const controller = timeoutMs > 0 ? new AbortController() : null;
+  const timeout =
+    controller && timeoutMs > 0
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null;
   try {
     const res = await fetch(apiUrl, {
       headers: {
@@ -497,7 +475,7 @@ async function fetchVaplayerJSON(apiUrl, timeoutMs = 6000) {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
       },
-      signal: controller.signal,
+      ...(controller ? { signal: controller.signal } : {}),
     });
     if (!res.ok) {
       discardBody(res);
@@ -505,7 +483,7 @@ async function fetchVaplayerJSON(apiUrl, timeoutMs = 6000) {
     }
     return await res.json();
   } finally {
-    clearTimeout(timeout);
+    if (timeout) clearTimeout(timeout);
   }
 }
 
@@ -707,7 +685,7 @@ async function scrapeVaplayerAPI(type, tmdb_id, season, episode) {
   try {
     // The API itself answers in well under a second normally; give it
     // longer than the default so a busy moment doesn't lose every mirror.
-    const json = await fetchVaplayerJSON(apiUrl, 12000).catch((err) => {
+    const json = await fetchVaplayerJSON(apiUrl, 0).catch((err) => {
       throw new Error(`streamdata API: ${err.message}`);
     });
     const streamUrls = json?.data?.stream_urls;
@@ -821,7 +799,7 @@ async function fetchMovyMeta(type, tmdb_id) {
     const url =
       `https://api.themoviedb.org/3/${path}?api_key=${TMDB_API_KEY}` +
       `&append_to_response=external_ids`;
-    const res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
+    const res = await fetch(url, { headers });
     if (!res.ok) return null;
     const j = await res.json();
     const title = type === "tv" ? j.name || j.original_name : j.title || j.original_title;
@@ -854,7 +832,7 @@ async function scrapeMovy(type, tmdb_id, season, episode) {
     if (!meta?.title) return { streams: [], subtitles: [], transient: false };
     // No extract-level budget: wait for the city race. Cache on /extract
     // makes the next hit cheap. Nashville is excluded — see scrapeNashville.
-    const result = await fetchMovyStreams(type, tmdb_id, season, episode, meta, 30000);
+    const result = await fetchMovyStreams(type, tmdb_id, season, episode, meta, 0);
     // Keep 1080p + 2K/4K only (drop 720/480/360). "Auto"/unlabeled still
     // probed in case the master actually carries 1080+.
     const candidates = (result?.streams || [])
@@ -927,7 +905,7 @@ async function scrapeNashville(type, tmdb_id, season, episode) {
   try {
     const meta = await fetchMovyMeta(type, tmdb_id);
     if (!meta?.title) return { streams: [], subtitles: [], transient: false };
-    const result = await fetchMovyStreams(type, tmdb_id, season, episode, meta, 25000, {
+    const result = await fetchMovyStreams(type, tmdb_id, season, episode, meta, 0, {
       cities: [NASHVILLE_CITY],
     });
     const candidates = (result?.streams || [])
@@ -1544,7 +1522,7 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
 
   const origin = `${req.protocol}://${req.get("host")}`;
   const cacheKey = extractCacheKey({ type, tmdb_id, season, episode });
-  const cached = extractCache.get(cacheKey);
+  const cached = getExtractCache(cacheKey);
   const now = Date.now();
 
   if (cached && cacheEntryFresh(cached, now)) {

@@ -120,19 +120,23 @@ export function decryptWecollegePayload(payloadB64, seed, mediaId) {
 }
 
 async function fetchSeed(mediaId, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // timeoutMs <= 0 → no abort (extract relies on durable cache instead).
+  const controller = timeoutMs > 0 ? new AbortController() : null;
+  const timer =
+    controller && timeoutMs > 0
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null;
   try {
     const res = await fetch(`${STREAM_API}/seed?mediaId=${encodeURIComponent(mediaId)}`, {
       headers: API_HEADERS,
-      signal: controller.signal,
+      ...(controller ? { signal: controller.signal } : {}),
     });
     if (!res.ok) throw new Error(`seed ${res.status}`);
     const json = await res.json();
     if (!json?.seed) throw new Error("seed missing");
     return json.seed;
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -142,15 +146,21 @@ function sourceQualityLabel(s) {
 }
 
 async function fetchCitySources(city, params, mediaId, seed, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const controller = timeoutMs > 0 ? new AbortController() : null;
+  const timer =
+    controller && timeoutMs > 0
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null;
   try {
     const url = new URL(`${STREAM_API}/${city}/sources`);
     for (const [k, v] of Object.entries({ ...params, enc: "2", seed })) {
       if (v == null || v === "") continue;
       url.searchParams.set(k, String(v));
     }
-    const res = await fetch(url, { headers: API_HEADERS, signal: controller.signal });
+    const res = await fetch(url, {
+      headers: API_HEADERS,
+      ...(controller ? { signal: controller.signal } : {}),
+    });
     const text = await res.text();
     if (!res.ok) {
       const err = new Error(`${city} ${res.status}`);
@@ -174,7 +184,7 @@ async function fetchCitySources(city, params, mediaId, seed, timeoutMs) {
       subtitles: Array.isArray(json?.subtitles) ? json.subtitles : [],
     };
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -191,7 +201,7 @@ export async function fetchMovyStreams(
   season,
   episode,
   meta,
-  timeoutMs = 8000,
+  timeoutMs = 0,
   { cities = CITIES } = {}
 ) {
   if (!meta?.title || !tmdb_id) return null;
@@ -210,12 +220,15 @@ export async function fetchMovyStreams(
     altTitle: meta.altTitle || meta.originalTitle || undefined,
   };
 
-  // Seed is sequential; leave most of the budget for the city race. Under
-  // load the seed endpoint has been seen approaching 4s, so don't starve it.
-  const seedTimeout = Math.min(6000, Math.max(2500, Math.floor(timeoutMs * 0.35)));
+  // timeoutMs <= 0: no abort on seed or cities (durable /extract cache is
+  // the latency budget). Positive values keep the old seed/city split.
+  const noTimeout = !(timeoutMs > 0);
+  const seedTimeout = noTimeout
+    ? 0
+    : Math.min(6000, Math.max(2500, Math.floor(timeoutMs * 0.35)));
   const seed = await fetchSeed(tmdb_id, seedTimeout);
 
-  const cityTimeout = Math.max(5000, timeoutMs - seedTimeout);
+  const cityTimeout = noTimeout ? 0 : Math.max(5000, timeoutMs - seedTimeout);
   const cityList = Array.isArray(cities) && cities.length ? cities : CITIES;
   const results = await Promise.all(
     cityList.map((city) =>
