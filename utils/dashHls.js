@@ -6,6 +6,7 @@ import { spawn } from "child_process";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
+import { withFfmpegSlot } from "./ffmpegSlot.js";
 
 const ROOT = process.env.DASH_HLS_CACHE || "/tmp/srctv-dashhls";
 const IDLE_MS = 1000 * 60 * 90;
@@ -13,8 +14,8 @@ const IDLE_MS = 1000 * 60 * 90;
 const READY_TIMEOUT_MS = 1000 * 60 * 12;
 const SPEED_SAMPLE_MS = 1000 * 45;
 const SAFETY = 1.3;
-const MIN_BUFFER_SEC = 120;
-const MAX_BUFFER_SEC = 900;
+const MIN_BUFFER_SEC = 180;
+const MAX_BUFFER_SEC = 600;
 
 /** @type {Map<string, { child: import('child_process').ChildProcess|null, dir: string, playlist: string, ready: Promise<string>, lastUsed: number, failed?: string, expectedSec?: number, startedAt?: number }>} */
 const jobs = new Map();
@@ -49,10 +50,37 @@ function playlistHasEnd(playlistPath) {
 }
 
 function isRemuxComplete(playlistPath, expectedSec) {
-  if (!fs.existsSync(playlistPath) || !playlistHasEnd(playlistPath)) return false;
+  if (!fs.existsSync(playlistPath)) return false;
   const dur = playlistDurationSec(playlistPath);
-  if (expectedSec && expectedSec > 30) return dur >= expectedSec * 0.9;
-  return dur >= 120;
+  if (!(expectedSec && expectedSec > 30 ? dur >= expectedSec * 0.9 : dur >= 120)) {
+    return false;
+  }
+  // Prefer ENDLIST, but a full-length playlist without it still counts.
+  return true;
+}
+
+/** ffmpeg sometimes writes ENDLIST on crash despite omit_endlist — strip it. */
+function stripPrematureEndlist(playlistPath, expectedSec) {
+  try {
+    if (!fs.existsSync(playlistPath)) return;
+    const dur = playlistDurationSec(playlistPath);
+    const longEnough =
+      expectedSec && expectedSec > 30 ? dur >= expectedSec * 0.9 : dur >= 120;
+    if (longEnough) return;
+    const text = fs.readFileSync(playlistPath, "utf8");
+    if (!/#EXT-X-ENDLIST/i.test(text)) return;
+    fs.writeFileSync(
+      playlistPath,
+      text
+        .split("\n")
+        .filter((l) => !/^#EXT-X-ENDLIST/i.test(l.trim()))
+        .join("\n")
+    );
+    console.warn(
+      `[dash-hls] stripped premature ENDLIST at ${dur.toFixed(0)}s` +
+        (expectedSec ? `/${expectedSec.toFixed(0)}s` : "")
+    );
+  } catch {}
 }
 
 async function fetchMpdDurationSec(mpdUrl) {
@@ -158,7 +186,7 @@ function requiredBufferSec(expectedSec, speed) {
   return Math.max(MIN_BUFFER_SEC, Math.min(MAX_BUFFER_SEC, need));
 }
 
-function waitUntilBuffered(playlist, expectedSec, startedAt, timeoutMs) {
+function waitUntilBuffered(playlist, expectedSec, startedAt, timeoutMs, getFailed) {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + timeoutMs;
     let target = MIN_BUFFER_SEC;
@@ -166,7 +194,12 @@ function waitUntilBuffered(playlist, expectedSec, startedAt, timeoutMs) {
 
     const tick = () => {
       try {
-        if (isRemuxComplete(playlist, expectedSec)) return resolve(playlist);
+        const fail = getFailed?.();
+        if (fail) return reject(new Error(fail));
+        stripPrematureEndlist(playlist, expectedSec);
+        if (isRemuxComplete(playlist, expectedSec) && playlistHasEnd(playlist)) {
+          return resolve(playlist);
+        }
         const dur = playlistDurationSec(playlist);
         const wall = (Date.now() - startedAt) / 1000;
         if (!sampled && wall >= SPEED_SAMPLE_MS / 1000 && dur > 5) {
@@ -258,49 +291,60 @@ export async function ensureDashHls(mpdUrl) {
 
       const startedAt = Date.now();
       job.startedAt = startedAt;
-      const child = spawn("ffmpeg", buildFfmpegArgs(mpdUrl, dir, playlist), {
-        stdio: ["ignore", "ignore", "pipe"],
+
+      // Encode under the global slot for the full job lifetime (so fMP4 copy
+      // remuxes can't steal CPU mid-episode), but resolve ready as soon as
+      // the adaptive pre-buffer is on disk so the player can start.
+      const encodePromise = withFfmpegSlot(async () => {
+        if (isRemuxComplete(playlist, expectedSec)) return;
+
+        const child = spawn("ffmpeg", buildFfmpegArgs(mpdUrl, dir, playlist), {
+          stdio: ["ignore", "ignore", "pipe"],
+        });
+        job.child = child;
+        let stderr = "";
+        child.stderr?.on("data", (chunk) => {
+          stderr = (stderr + chunk.toString("utf8")).slice(-2000);
+        });
+
+        await new Promise((resolve) => {
+          child.on("exit", (code) => {
+            const cur = jobs.get(key);
+            if (cur) cur.child = null;
+            const dur = playlistDurationSec(playlist);
+            stripPrematureEndlist(playlist, cur?.expectedSec);
+            const complete = isRemuxComplete(playlist, cur?.expectedSec);
+            if (complete && fs.existsSync(playlist) && !playlistHasEnd(playlist)) {
+              try {
+                fs.appendFileSync(playlist, "\n#EXT-X-ENDLIST\n");
+              } catch {}
+            }
+            if (!complete && dur < (cur?.expectedSec || 120) * 0.9) {
+              const msg =
+                `ffmpeg ended early after ${dur.toFixed(0)}s` +
+                (cur?.expectedSec ? ` (expected ~${cur.expectedSec.toFixed(0)}s)` : "") +
+                (code ? ` (exit ${code})` : "") +
+                (stderr ? `: ${stderr.trim()}` : "");
+              if (cur) cur.failed = msg;
+              console.error(`[dash-hls] ${msg}`);
+            } else if (complete) {
+              console.log(`[dash-hls] remux complete ${key}: ${dur.toFixed(0)}s`);
+            }
+            resolve();
+          });
+        });
       });
-      job.child = child;
-      let stderr = "";
-      child.stderr?.on("data", (chunk) => {
-        stderr = (stderr + chunk.toString("utf8")).slice(-2000);
+      encodePromise.catch((err) => {
+        console.error(`[dash-hls] encode slot error: ${err?.message || err}`);
       });
 
-      child.on("exit", (code) => {
-        const cur = jobs.get(key);
-        if (!cur) return;
-        cur.child = null;
-        const dur = playlistDurationSec(playlist);
-        const complete = isRemuxComplete(playlist, cur.expectedSec);
-        if (fs.existsSync(playlist) && !playlistHasEnd(playlist) && dur >= 60) {
-          // Only finalize ENDLIST when we actually finished (or got enough).
-          if (complete || (cur.expectedSec && dur >= cur.expectedSec * 0.9)) {
-            try {
-              fs.appendFileSync(playlist, "\n#EXT-X-ENDLIST\n");
-            } catch {}
-          }
-        }
-        if (code && code !== 0 && !isRemuxComplete(playlist, cur.expectedSec)) {
-          cur.failed = `ffmpeg exited ${code} after ${dur.toFixed(0)}s: ${stderr.trim()}`;
-          console.error(`[dash-hls] ${cur.failed}`);
-          return;
-        }
-        if (!isRemuxComplete(playlist, cur.expectedSec)) {
-          // Encoder died early without ENDLIST — mark failed so next hit restarts.
-          if (dur < (cur.expectedSec || 120) * 0.9) {
-            cur.failed =
-              `ffmpeg ended early after ${dur.toFixed(0)}s` +
-              (cur.expectedSec ? ` (expected ~${cur.expectedSec.toFixed(0)}s)` : "") +
-              (stderr ? `: ${stderr.trim()}` : "");
-            console.error(`[dash-hls] ${cur.failed}`);
-          }
-        } else {
-          console.log(`[dash-hls] remux complete ${key}: ${dur.toFixed(0)}s`);
-        }
-      });
-
-      await waitUntilBuffered(playlist, expectedSec, startedAt, READY_TIMEOUT_MS);
+      await waitUntilBuffered(
+        playlist,
+        expectedSec,
+        startedAt,
+        READY_TIMEOUT_MS,
+        () => job.failed
+      );
       resolveReady(playlist);
     } catch (err) {
       try {

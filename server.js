@@ -431,6 +431,32 @@ function qualityLabel(res) {
   return tier ? `${tier}p` : null;
 }
 
+// Tizen remux: prefer ≤1080p of the same source so we don't burn the
+// droplet's NIC/CPU copying 2160p while Nashville needs the cores.
+function streamHeight(s) {
+  return (
+    qualityTier(s) ||
+    Number(s.height) ||
+    claimedQualityDims(s.quality)?.height ||
+    0
+  );
+}
+function pickFmp4ForTizen(s, all) {
+  if (!s || !["movy", "flixhq", "ophim"].includes(s.source)) return s;
+  const same = (all || []).filter((x) => x.source === s.source && x.url);
+  if (same.length <= 1) return s;
+  const scored = same
+    .map((x) => ({ x, h: streamHeight(x) }))
+    .filter((t) => t.h > 0);
+  if (!scored.length) return s;
+  const hd = scored
+    .filter((t) => t.h >= 720 && t.h <= 1080)
+    .sort((a, b) => b.h - a.h)[0];
+  if (hd) return hd.x;
+  const below = scored.filter((t) => t.h <= 1080).sort((a, b) => b.h - a.h)[0];
+  return below?.x || s;
+}
+
 // Movy city payloads label streams "2160p"/"1080p"/"Auto" even when the
 // CDN hands back a bare media playlist with no RESOLUTION tags. Map those
 // labels onto pixel dims so ranking / mirrors don't collapse to movy@null.
@@ -1263,6 +1289,23 @@ app.get("/dash-hls/:hash/:file", async (req, res) => {
       const full = readDashHlsFile(src, "index.m3u8");
       if (!full) return res.status(502).send("Remux not ready");
       let text = sanitizeTizenPlaylist(fs.readFileSync(full, "utf8"));
+      // Never advertise ENDLIST while the remux is still short of the MPD
+      // duration — a crashed ffmpeg can leave a premature ENDLIST that makes
+      // Tizen stop polling mid-episode.
+      if (/#EXT-X-ENDLIST/i.test(text)) {
+        const dur = [...text.matchAll(/#EXTINF:([\d.]+)/g)].reduce(
+          (a, m) => a + Number(m[1]),
+          0
+        );
+        // Keep ENDLIST only for playlists that look finished (≥2 min and
+        // no active ffmpeg). Active jobs are tracked inside dashHls.
+        if (dur < 120) {
+          text = text
+            .split("\n")
+            .filter((l) => !/^#EXT-X-ENDLIST/i.test(l.trim()))
+            .join("\n");
+        }
+      }
       // Rewrite segment URIs so they keep ?src= for the shared cache key.
       const qs = `?src=${encodeURIComponent(src)}`;
       text = text
@@ -1809,39 +1852,44 @@ async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) 
 
     // Stamp &cdn= so /hls-proxy doesn't depend on hostname allowlists for
     // sources that rotate CDNs (Movy). Child playlist rewrites preserve it.
-    const proxied = (s) => {
+    const proxied = (s, { warm = false } = {}) => {
       // Nashville is VP9/Opus DASH — Tizen/hls.js can't play it raw. Point at
       // the dash→hls remux which serves real H.264/MP2 HLS.
       if (s.source === "nashville") {
         const hash = dashHlsHash(s.url);
-        // Kick remux in the background so the first playlist hit is warmer.
-        ensureDashHls(s.url).catch((err) =>
-          console.warn(`[nashville] remux warm failed: ${err.message}`)
-        );
+        if (warm) {
+          ensureDashHls(s.url).catch((err) =>
+            console.warn(`[nashville] remux warm failed: ${err.message}`)
+          );
+        }
         return `${origin}/dash-hls/${hash}/index.m3u8?src=${encodeURIComponent(s.url)}`;
       }
       // movy/flixhq/ophim are fMP4 (EXT-X-MAP). Tizen AVPlay won't play them
       // reliably — remux to MPEG-TS via stream copy (~20x realtime).
       if (s.source === "movy" || s.source === "flixhq" || s.source === "ophim") {
-        const hash = fmp4HlsHash(s.url);
-        ensureFmp4Hls(s.url, s.source).catch((err) =>
-          console.warn(`[${s.source}] ts remux warm failed: ${err.message}`)
-        );
-        return `${origin}/ts-hls/${hash}/index.m3u8?src=${encodeURIComponent(s.url)}&source=${encodeURIComponent(s.source)}`;
+        const pick = pickFmp4ForTizen(s, uniqueStreams);
+        const hash = fmp4HlsHash(pick.url);
+        if (warm) {
+          ensureFmp4Hls(pick.url, pick.source).catch((err) =>
+            console.warn(`[${pick.source}] ts remux warm failed: ${err.message}`)
+          );
+        }
+        return `${origin}/ts-hls/${hash}/index.m3u8?src=${encodeURIComponent(pick.url)}&source=${encodeURIComponent(pick.source)}`;
       }
       const cdn =
         s.source === "movy" ? "&cdn=movy" : s.source === "catflix" ? "&cdn=catflix" : "";
       return `${origin}/hls-proxy?url=${encodeURIComponent(s.url)}${cdn}`;
     };
-    const proxiedHlsUrl = best ? proxied(best) : null;
+    const proxiedHlsUrl = best ? proxied(best, { warm: true }) : null;
     // One entry per source+quality. Movy only keeps 1080p/2160p; other
     // sources usually expose a single master. hls_url is mirrors[0] unless
-    // ?source= pins another source.
+    // ?source= pins another source. Only warm the chosen best — remuxing
+    // every mirror at once starves Nashville on a 1GB droplet.
     const mirrors = [];
     for (const s of uniqueStreams) {
       const quality = qualityLabel(s);
       if (mirrors.some((m) => m.source === s.source && m.quality === quality)) continue;
-      mirrors.push({ hls_url: proxied(s), source: s.source, quality });
+      mirrors.push({ hls_url: proxied(s, { warm: false }), source: s.source, quality });
     }
 
     // The heavy scrapers (YIFY zip-validation for movies, addic7ed for TV) take

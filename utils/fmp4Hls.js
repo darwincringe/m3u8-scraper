@@ -5,6 +5,7 @@ import { spawn } from "child_process";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
+import { withFfmpegSlot } from "./ffmpegSlot.js";
 
 const ROOT = process.env.FMP4_HLS_CACHE || "/tmp/srctv-fmp4hls";
 const IDLE_MS = 1000 * 60 * 90;
@@ -156,34 +157,52 @@ export async function ensureFmp4Hls(srcUrl, source = "") {
       }
 
       const input = inputUrlForFfmpeg(srcUrl, source);
-      const child = spawn("ffmpeg", buildFfmpegArgs(input, dir, playlist), {
-        stdio: ["ignore", "ignore", "pipe"],
-      });
-      job.child = child;
-      let stderr = "";
-      child.stderr?.on("data", (chunk) => {
-        stderr = (stderr + chunk.toString("utf8")).slice(-2000);
-      });
-
-      child.on("exit", (code) => {
-        const cur = jobs.get(key);
-        if (!cur) return;
-        cur.child = null;
-        const dur = playlistDurationSec(playlist);
-        if (fs.existsSync(playlist) && !playlistHasEnd(playlist) && dur >= 30) {
-          try {
-            fs.appendFileSync(playlist, "\n#EXT-X-ENDLIST\n");
-          } catch {}
+      await withFfmpegSlot(async () => {
+        // Re-check after waiting for a slot — another warm may have finished.
+        if (playlistHasEnd(playlist) && playlistDurationSec(playlist) >= 60) {
+          return;
         }
-        if (code && code !== 0 && dur < 30) {
-          cur.failed = `ffmpeg exited ${code} after ${dur.toFixed(0)}s: ${stderr.trim()}`;
-          console.error(`[fmp4-hls] ${cur.failed}`);
-        } else {
-          console.log(`[fmp4-hls] remux done ${key}: ${dur.toFixed(0)}s`);
-        }
-      });
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const child = spawn("ffmpeg", buildFfmpegArgs(input, dir, playlist), {
+          stdio: ["ignore", "ignore", "pipe"],
+        });
+        job.child = child;
+        let stderr = "";
+        child.stderr?.on("data", (chunk) => {
+          stderr = (stderr + chunk.toString("utf8")).slice(-2000);
+        });
 
-      await fileReady(playlist, READY_TIMEOUT_MS);
+        const exitPromise = new Promise((resolve) => {
+          child.on("exit", (code) => {
+            const cur = jobs.get(key);
+            if (cur) cur.child = null;
+            const dur = playlistDurationSec(playlist);
+            if (fs.existsSync(playlist) && !playlistHasEnd(playlist) && dur >= 30) {
+              try {
+                fs.appendFileSync(playlist, "\n#EXT-X-ENDLIST\n");
+              } catch {}
+            }
+            if (code && code !== 0 && dur < 30) {
+              const msg = `ffmpeg exited ${code} after ${dur.toFixed(0)}s: ${stderr.trim()}`;
+              if (cur) cur.failed = msg;
+              console.error(`[fmp4-hls] ${msg}`);
+            } else {
+              console.log(`[fmp4-hls] remux done ${key}: ${dur.toFixed(0)}s`);
+            }
+            resolve();
+          });
+        });
+
+        await Promise.race([
+          fileReady(playlist, READY_TIMEOUT_MS),
+          exitPromise.then(() => {
+            if (!fs.existsSync(playlist)) throw new Error("fmp4→ts ffmpeg exited before playlist");
+            return playlist;
+          }),
+        ]);
+        // Release the slot once the playlist is ready; let ffmpeg finish in
+        // the background without blocking other remuxes for the whole VOD.
+      });
       resolveReady(playlist);
     } catch (err) {
       try {
