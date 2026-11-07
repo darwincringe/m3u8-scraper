@@ -198,6 +198,15 @@ export async function findWyzieMovieSubtitleCandidates(id) {
   return searchWyzieCandidates(id);
 }
 
+/** English-only Wyzie candidates (same { downloadUrl, release } shape). */
+export async function findWyzieEnglishSubtitleCandidates(id, season, episode) {
+  const all =
+    season != null && episode != null
+      ? await findWyzieTVSubtitleCandidates(id, season, episode)
+      : await findWyzieMovieSubtitleCandidates(id);
+  return all.filter((c) => /^ENGLISH\./i.test(String(c.release || "")));
+}
+
 // Downloads a Wyzie subtitle URL and returns decoded SRT text. Cached by URL.
 export async function downloadWyzieSubtitleSRT(downloadUrl) {
   const cached = srtCache.get(downloadUrl);

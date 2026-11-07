@@ -16,6 +16,7 @@ import {
 import {
   findWyzieTVSubtitleCandidates,
   findWyzieMovieSubtitleCandidates,
+  findWyzieEnglishSubtitleCandidates,
   downloadWyzieSubtitleSRT,
 } from "./utils/wyzieSubtitles.js";
 import {
@@ -26,12 +27,6 @@ import {
 import { registerSyncRoutes, requireAuth, requirePremium } from "./srctvSync.js";
 import { fetchCatflixStream, fetchFlixhqStreams, fetchOphimStreams } from "./utils/catflix.js";
 import { fetchMovyStreams, NASHVILLE_CITY } from "./utils/wecollege.js";
-import {
-  ensureDashHls,
-  dashHlsHash,
-  readDashHlsFile,
-  sanitizeTizenPlaylist,
-} from "./utils/dashHls.js";
 import {
   loadExtractCache,
   extractCacheKey,
@@ -73,7 +68,7 @@ const globalLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests, please slow down" },
-  skip: (req) => req.path === "/hls-proxy" || req.path.startsWith("/dash-hls/"),
+  skip: (req) => req.path === "/hls-proxy",
 });
 const extractLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -825,6 +820,17 @@ async function fetchMovyMeta(type, tmdb_id) {
   }
 }
 
+/** Prefer Movy 1080p + 2160p; if neither exists, keep only the highest tier. */
+function selectMovyQualities(streams) {
+  if (!streams?.length) return [];
+  const withTier = streams.map((s) => ({ s, tier: qualityTier(s) || 0 }));
+  const preferred = withTier.filter((t) => t.tier === 1080 || t.tier === 2160);
+  if (preferred.length) return preferred.map((t) => t.s);
+  const best = Math.max(...withTier.map((t) => t.tier));
+  if (best <= 0) return streams.slice(0, 1);
+  return withTier.filter((t) => t.tier === best).map((t) => t.s);
+}
+
 async function scrapeMovy(type, tmdb_id, season, episode) {
   try {
     let meta = await fetchMovyMeta(type, tmdb_id);
@@ -833,34 +839,27 @@ async function scrapeMovy(type, tmdb_id, season, episode) {
     // No extract-level budget: wait for the city race. Cache on /extract
     // makes the next hit cheap. Nashville is excluded — see scrapeNashville.
     const result = await fetchMovyStreams(type, tmdb_id, season, episode, meta, 0);
-    // Keep 1080p + 2K/4K only (drop 720/480/360). "Auto"/unlabeled still
-    // probed in case the master actually carries 1080+.
+    // Probe everything Movy returns (incl. lower tiers) so we can fall back
+    // to the highest available when 1080/2160 are missing.
     const candidates = (result?.streams || [])
       .filter((s) => s?.url && !/\.json(\?|$)/i.test(s.url))
-      .filter((s) => {
-        const claimed = claimedQualityDims(s.quality);
-        if (!claimed) return true;
-        return qualityTier(claimed) >= 1080;
-      })
       .slice(0, 12);
     if (!candidates.length) return { streams: [], subtitles: [], transient: false };
 
-    // Probe reachability in parallel. Prefer probe-measured RESOLUTION when
-    // present; otherwise keep Movy's claimed label (2160p/1080p/…) so bare
-    // media playlists from goldenkite still rank and show in mirrors.
+    // Prefer probe-measured RESOLUTION when present; otherwise keep Movy's
+    // claimed label (2160p/1080p/…) so bare media playlists still rank.
     const claimedByUrl = new Map(candidates.map((s) => [s.url, s.quality]));
     const probed = await probeStreamUrls(
       candidates.map((s) => s.url),
       8000,
       1
     );
-    const streams = probed
-      .map((s) => {
-        if (s.width || s.height) return { ...s, source: "movy" };
-        const claimed = claimedQualityDims(claimedByUrl.get(s.url));
-        return claimed ? { ...s, ...claimed, source: "movy" } : { ...s, source: "movy" };
-      })
-      .filter((s) => qualityTier(s) >= 1080);
+    const labeled = probed.map((s) => {
+      if (s.width || s.height) return { ...s, source: "movy" };
+      const claimed = claimedQualityDims(claimedByUrl.get(s.url));
+      return claimed ? { ...s, ...claimed, source: "movy" } : { ...s, source: "movy" };
+    });
+    const streams = selectMovyQualities(labeled);
     if (!streams.length) console.warn(`[movy] manifest unreachable for ${type} ${tmdb_id}`);
     return {
       streams,
@@ -898,9 +897,9 @@ async function probeManifestAlive(url, timeoutMs = 10000) {
   }
 }
 
-// Last-resort Movy city. Nashville often finds Asian dramas other extractors
-// miss, but returns finalsignal DASH labeled "Auto" — fine when nothing else
-// works, bad as a default ahead of vaplayer/HLS cities.
+// Movy "Nashville" city — vapplayer-only fallback (not a global last resort).
+// Often finds Asian dramas other extractors miss; returns finalsignal DASH
+// labeled "Auto". Served via /hls-proxy (no ffmpeg remux).
 async function scrapeNashville(type, tmdb_id, season, episode) {
   try {
     const meta = await fetchMovyMeta(type, tmdb_id);
@@ -1220,75 +1219,6 @@ async function* resumeStream(head, iterator, done) {
 // segment sits in kernel socket buffers (CLOSE_WAIT) plus node's stream
 // buffers — about 1-10 MB per zombie — until the process restarts. That is
 // exactly how a 1 GB host ends up swapped out after a couple of days.
-// Nashville DASH → HLS remux. Playlist waits for an adaptive pre-buffer so
-// Tizen cannot outrun a sub-realtime VP9→H.264 encode on this droplet.
-app.get("/dash-hls/:hash/:file", async (req, res) => {
-  const src = typeof req.query.src === "string" ? req.query.src : "";
-  const file = String(req.params.file || "");
-  if (!src || !/^https?:\/\//i.test(src)) {
-    return res.status(400).send("Missing src");
-  }
-  if (dashHlsHash(src) !== req.params.hash) {
-    return res.status(400).send("Hash mismatch");
-  }
-  try {
-    if (/^index\.m3u8$/i.test(file)) {
-      await ensureDashHls(src);
-      const full = readDashHlsFile(src, "index.m3u8");
-      if (!full) return res.status(502).send("Remux not ready");
-      let text = sanitizeTizenPlaylist(fs.readFileSync(full, "utf8"));
-      // Never advertise ENDLIST while the remux is still short of the MPD
-      // duration — a crashed ffmpeg can leave a premature ENDLIST that makes
-      // Tizen stop polling mid-episode.
-      if (/#EXT-X-ENDLIST/i.test(text)) {
-        const dur = [...text.matchAll(/#EXTINF:([\d.]+)/g)].reduce(
-          (a, m) => a + Number(m[1]),
-          0
-        );
-        // Keep ENDLIST only for playlists that look finished (≥2 min and
-        // no active ffmpeg). Active jobs are tracked inside dashHls.
-        if (dur < 120) {
-          text = text
-            .split("\n")
-            .filter((l) => !/^#EXT-X-ENDLIST/i.test(l.trim()))
-            .join("\n");
-        }
-      }
-      // Rewrite segment URIs so they keep ?src= for the shared cache key.
-      const qs = `?src=${encodeURIComponent(src)}`;
-      text = text
-        .split("\n")
-        .map((line) => {
-          const t = line.trim();
-          if (!t || t.startsWith("#")) return line;
-          if (/^seg_\d+\.ts$/i.test(t)) return `${t}${qs}`;
-          return line;
-        })
-        .join("\n");
-      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-      res.setHeader("Cache-Control", "no-cache");
-      return res.send(text);
-    }
-    if (/^seg_\d+\.ts$/i.test(file)) {
-      // Playlist may race ahead of a segment on a slow encode — wait briefly.
-      const started = Date.now();
-      let full = readDashHlsFile(src, file);
-      while (!full && Date.now() - started < 45000) {
-        await new Promise((r) => setTimeout(r, 400));
-        full = readDashHlsFile(src, file);
-      }
-      if (!full) return res.status(404).send("Segment not ready");
-      res.setHeader("Content-Type", "video/mp2t");
-      res.setHeader("Cache-Control", "public, max-age=3600");
-      return fs.createReadStream(full).pipe(res);
-    }
-    return res.status(404).send("Not found");
-  } catch (err) {
-    console.error("[dash-hls]", err.message);
-    if (!res.headersSent) res.status(502).send("Remux failed");
-  }
-});
-
 app.get("/hls-proxy", async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).send("Missing url param");
@@ -1479,8 +1409,8 @@ app.get("/hls-proxy", async (req, res) => {
   }
 });
 
-//Extract endpoint for m3u8 scraper
-app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) => {
+// Shared /extract + /extract/vaplayer handler.
+async function handleExtractRequest(req, res, { includeWyzie, profile }) {
   const type = req.query.type || "movie";
   const tmdb_id = req.query.tmdb_id;
   const season = req.query.season ? parseInt(req.query.season) : undefined;
@@ -1506,9 +1436,7 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
     });
   }
 
-  // Optional source pin: ?source=vaplayer|flixhq|catflix|ophim makes hls_url
-  // come from that source instead of the best-ranked one. `mirrors` always
-  // lists every source that has a stream, so a UI can offer a picker.
+  // Optional source pin: ?source=vaplayer|flixhq|catflix|ophim|movy|nashville
   const wantedSource = req.query.source;
   if (wantedSource !== undefined && !(wantedSource in SOURCE_PRIORITY)) {
     return res.status(400).json({
@@ -1521,9 +1449,10 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
   }
 
   const origin = `${req.protocol}://${req.get("host")}`;
-  const cacheKey = extractCacheKey({ type, tmdb_id, season, episode });
+  const cacheKey = extractCacheKey({ type, tmdb_id, season, episode, profile });
   const cached = getExtractCache(cacheKey);
   const now = Date.now();
+  const buildArgs = { type, tmdb_id, season, episode, origin, includeWyzie };
 
   if (cached && cacheEntryFresh(cached, now)) {
     console.log(`[extract] cache hit ${cacheKey}`);
@@ -1537,21 +1466,13 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
       ? cached
       : null;
 
-  // Soft-expired but still usable: kick a background refresh and serve the
-  // last good answer immediately so play never waits on a cold scrape.
   if (staleGood) {
     if (!extractRevalidating.has(cacheKey) && !extractInflight.has(cacheKey)) {
       console.log(`[extract] serving stale + revalidating ${cacheKey}`);
       extractRevalidating.add(cacheKey);
       (async () => {
         try {
-          const result = await buildExtractResponseWithRetry({
-            type,
-            tmdb_id,
-            season,
-            episode,
-            origin,
-          });
+          const result = await buildExtractResponseWithRetry(buildArgs);
           rememberExtractSuccess(cacheKey, result.response, result.transient);
         } catch (err) {
           console.warn(`[extract] revalidate failed ${cacheKey}: ${err.message}`);
@@ -1567,20 +1488,12 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
     );
   }
 
-  // Coalesce concurrent cold lookups for the same title so Movy's city race
-  // only runs once when several viewers hit play together.
   let inflight = extractInflight.get(cacheKey);
   let joined = false;
   if (!inflight) {
     inflight = (async () => {
       try {
-        return await buildExtractResponseWithRetry({
-          type,
-          tmdb_id,
-          season,
-          episode,
-          origin,
-        });
+        return await buildExtractResponseWithRetry(buildArgs);
       } finally {
         extractInflight.delete(cacheKey);
       }
@@ -1596,19 +1509,11 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
     try {
       result = await inflight;
     } catch (joinedErr) {
-      // Shared cold scrape failed — don't leave every waiter on a dead
-      // promise. One solo retry recovers the "refresh fixes it" case.
       if (!joined) throw joinedErr;
       console.warn(
         `[extract] inflight failed, solo retry ${cacheKey}: ${joinedErr.message}`
       );
-      result = await buildExtractResponseWithRetry({
-        type,
-        tmdb_id,
-        season,
-        episode,
-        origin,
-      });
+      result = await buildExtractResponseWithRetry(buildArgs);
     }
 
     const { response, transient } = result;
@@ -1621,6 +1526,65 @@ app.get("/extract", ...requirePremiumAccess, extractLimiter, async (req, res) =>
       error: "Unexpected server error",
       hls_url: null,
       mirrors: [],
+      subtitles: [],
+    });
+  }
+}
+
+// Classic extract: vapplayer/movy/flixhq/catflix/ophim (+ nashville as
+// vapplayer-only fallback), Wyzie + source subtitles, mirrors.
+app.get("/extract", ...requirePremiumAccess, extractLimiter, (req, res) =>
+  handleExtractRequest(req, res, { includeWyzie: true, profile: "full" })
+);
+
+// Stream extract without Wyzie — source/YIFY/addic7ed subtitles only.
+// Same response shape (hls_url, mirrors, subtitles with &release=).
+app.get("/extract/vaplayer", ...requirePremiumAccess, extractLimiter, (req, res) =>
+  handleExtractRequest(req, res, { includeWyzie: false, profile: "vaplayer" })
+);
+
+// English-only Wyzie subtitle list. Same URL&release= strings as extract.subtitles.
+app.get("/wyzie", ...requirePremiumAccess, extractLimiter, async (req, res) => {
+  const type = req.query.type || "movie";
+  const tmdb_id = req.query.tmdb_id;
+  const season = req.query.season ? parseInt(req.query.season) : undefined;
+  const episode = req.query.episode ? parseInt(req.query.episode) : undefined;
+
+  if (!tmdb_id) {
+    return res.status(400).json({
+      success: false,
+      error: "tmdb_id query param is required",
+      subtitles: [],
+    });
+  }
+  if (type === "tv" && (season == null || episode == null)) {
+    return res.status(400).json({
+      success: false,
+      error: "season and episode query params are required for TV shows",
+      subtitles: [],
+    });
+  }
+
+  try {
+    const candidates = await findWyzieEnglishSubtitleCandidates(
+      tmdb_id,
+      type === "tv" ? season : undefined,
+      type === "tv" ? episode : undefined
+    );
+    const subtitles = candidates.map(
+      ({ downloadUrl, release }) =>
+        `${downloadUrl}&release=${encodeURIComponent(release)}`
+    );
+    res.json({
+      success: subtitles.length > 0,
+      subtitles,
+      error: subtitles.length ? null : "No English Wyzie subtitles found",
+    });
+  } catch (err) {
+    console.error("[wyzie] Unexpected error:", err.message);
+    res.status(500).json({
+      success: false,
+      error: err.message || "Wyzie lookup failed",
       subtitles: [],
     });
   }
@@ -1646,25 +1610,30 @@ async function buildExtractResponseWithRetry(args) {
   return last ?? { response: { success: false, error: "No streams found", hls_url: null, mirrors: [], subtitles: [] }, transient: true };
 }
 
-async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) {
+async function buildExtractResponse({
+  type,
+  tmdb_id,
+  season,
+  episode,
+  origin,
+  includeWyzie = true,
+}) {
   try {
-    // Wyzie is independent of everything below, so start it now and collect
-    // it after the sources instead of paying its ~0.8s on top of them.
-    const wyziePromise = (
-      type === "movie"
-        ? findWyzieMovieSubtitleCandidates(tmdb_id)
-        : type === "tv"
-        ? findWyzieTVSubtitleCandidates(tmdb_id, season, episode)
-        : Promise.resolve([])
-    ).catch((err) => {
-      console.error("[extract] Wyzie subtitle lookup failed:", err.message);
-      return [];
-    });
+    const wyziePromise = includeWyzie
+      ? (
+          type === "movie"
+            ? findWyzieMovieSubtitleCandidates(tmdb_id)
+            : type === "tv"
+            ? findWyzieTVSubtitleCandidates(tmdb_id, season, episode)
+            : Promise.resolve([])
+        ).catch((err) => {
+          console.error("[extract] Wyzie subtitle lookup failed:", err.message);
+          return [];
+        })
+      : Promise.resolve([]);
 
-    // No per-source budget: wait for every scraper. /extract response cache
-    // + inflight coalesce keep repeat plays fast. Movy / flixhq / ophim /
-    // catflix key by TMDB S/E (not vaplayer's remapped index), so start them
-    // with the original episode while episode-resolve runs for vaplayer.
+    // No per-source budget: wait for every scraper. Cache + inflight coalesce
+    // keep repeat plays fast. Movy/flixhq/ophim/catflix key by TMDB S/E.
     const movyPromise = scrapeMovy(type, tmdb_id, season, episode);
     const flixhqPromise = scrapeFlixhq(type, tmdb_id, season, episode);
     const ophimPromise = scrapeOphim(type, tmdb_id, season, episode);
@@ -1684,10 +1653,6 @@ async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) 
       tmdbMetaPromise,
     ]);
 
-    // Subtitles first (needed before ranking): Wyzie first for languages;
-    // vaplayer pack is demoted when its English dialogue doesn't cover the
-    // TMDB episode synopsis (wrong file / wrong show). Source tracks stay
-    // appended under Wyzie so extra languages remain selectable.
     const extractorSubs = Array.isArray(result.subtitles) ? result.subtitles : [];
     const flixhqSubs = Array.isArray(flixhq.subtitles) ? flixhq.subtitles : [];
     const sourceSubs = [...extractorSubs, ...flixhqSubs];
@@ -1705,82 +1670,75 @@ async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) 
       );
     }
 
-    // Wyzie first (episode-accurate); source-bundled tracks always at the
-    // bottom (deduped). Wrong English packs stay selectable but last.
-    const seenSub = new Set(wyzieSubs);
-    const appendedSourceSubs = sourceSubs.filter((u) => {
-      if (seenSub.has(u)) return false;
-      seenSub.add(u);
-      return true;
-    });
-    let subtitles = [...wyzieSubs, ...appendedSourceSubs];
+    let subtitles;
+    if (includeWyzie) {
+      const seenSub = new Set(wyzieSubs);
+      const appendedSourceSubs = sourceSubs.filter((u) => {
+        if (seenSub.has(u)) return false;
+        seenSub.add(u);
+        return true;
+      });
+      subtitles = [...wyzieSubs, ...appendedSourceSubs];
+    } else {
+      // /extract/vaplayer: source tracks only (same URL&release= shape).
+      subtitles = [...sourceSubs];
+    }
 
     const vapStreams = vapUntrusted ? [] : result.streams;
     const demotedVap = vapUntrusted ? result.streams : [];
+    const vaplayerMissed = !result.streams?.length;
+
+    // Nashville = vapplayer fallback only (not a global last-resort). Remux
+    // removed — /hls-proxy already rewrites DASH MPDs.
+    const nashvilleStreams = vaplayerMissed
+      ? (await scrapeNashville(type, tmdb_id, season, episode)).streams || []
+      : [];
+
     let streams = [
-      ...rankStreams(vapStreams, movy.streams, catflix.streams, flixhq.streams, ophim.streams),
+      ...rankStreams(
+        vapStreams,
+        movy.streams,
+        catflix.streams,
+        flixhq.streams,
+        ophim.streams,
+        nashvilleStreams
+      ),
       ...demotedVap.map((s) => ({ ...s, source: "vaplayer" })),
     ];
-    // Deduplicate URLs if demotion somehow double-counted (shouldn't).
     const seenUrls = new Set();
-    let uniqueStreams = streams.filter((s) => {
+    const uniqueStreams = streams.filter((s) => {
       if (seenUrls.has(s.url)) return false;
       seenUrls.add(s.url);
       return true;
     });
-
-    // Nashville last-resort: only when vaplayer/movy/flixhq/catflix/ophim all
-    // missed. Keeps DASH/Auto out of the normal picker.
-    if (!uniqueStreams.length) {
-      const nashville = await scrapeNashville(type, tmdb_id, season, episode);
-      if (nashville.streams?.length) {
-        streams = rankStreams(nashville.streams);
-        uniqueStreams = streams;
-      }
-    }
 
     const best = uniqueStreams[0] || null;
     if (best) {
       console.log(
         `[extract] ${uniqueStreams.length} stream(s): ` +
           uniqueStreams.map((s) => `${s.source}@${qualityLabel(s) || "?"}`).join(", ") +
-          (vapUntrusted ? " (vaplayer demoted)" : "")
+          (vapUntrusted ? " (vaplayer demoted)" : "") +
+          (includeWyzie ? "" : " [no-wyzie]")
       );
     }
 
-    // Stamp &cdn= so /hls-proxy doesn't depend on hostname allowlists for
-    // sources that rotate CDNs (Movy). Child playlist rewrites preserve it.
-    const proxied = (s, { warm = false } = {}) => {
-      // Nashville is VP9/Opus DASH — Tizen/hls.js can't play it raw. Point at
-      // the dash→hls remux which serves real H.264/MP2 HLS.
-      if (s.source === "nashville") {
-        const hash = dashHlsHash(s.url);
-        if (warm) {
-          ensureDashHls(s.url).catch((err) =>
-            console.warn(`[nashville] remux warm failed: ${err.message}`)
-          );
-        }
-        return `${origin}/dash-hls/${hash}/index.m3u8?src=${encodeURIComponent(s.url)}`;
-      }
+    const proxied = (s) => {
       const cdn =
-        s.source === "movy" ? "&cdn=movy" : s.source === "catflix" ? "&cdn=catflix" : "";
+        s.source === "movy" || s.source === "nashville"
+          ? "&cdn=movy"
+          : s.source === "catflix"
+            ? "&cdn=catflix"
+            : "";
       return `${origin}/hls-proxy?url=${encodeURIComponent(s.url)}${cdn}`;
     };
-    const proxiedHlsUrl = best ? proxied(best, { warm: true }) : null;
-    // One entry per source+quality. Movy only keeps 1080p/2160p; other
-    // sources usually expose a single master. hls_url is mirrors[0] unless
-    // ?source= pins another source.
+    const proxiedHlsUrl = best ? proxied(best) : null;
     const mirrors = [];
     for (const s of uniqueStreams) {
       const quality = qualityLabel(s);
       if (mirrors.some((m) => m.source === s.source && m.quality === quality)) continue;
-      mirrors.push({ hls_url: proxied(s, { warm: false }), source: s.source, quality });
+      mirrors.push({ hls_url: proxied(s), source: s.source, quality });
     }
 
-    // The heavy scrapers (YIFY zip-validation for movies, addic7ed for TV) take
-    // ~10s, so they stay a FALLBACK — only run when we STILL have nothing —
-    // otherwise every playback start that already has Wyzie/extractor subtitles
-    // would eat that delay.
     if (subtitles.length === 0) {
       if (type === "movie" && result.imdb_id) {
         try {
@@ -1826,8 +1784,6 @@ async function buildExtractResponse({ type, tmdb_id, season, episode, origin }) 
       flixhq.transient ||
       ophim.transient ||
       movy.transient ||
-      // Don't pin an empty-sub extract for 15m — Wyzie blips were getting
-      // cached and the player showed "no subtitles" until refresh.
       (best && (!subtitles || subtitles.length === 0))
     );
     return { response, transient };

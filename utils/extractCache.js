@@ -72,12 +72,15 @@ function scheduleSave() {
   saveTimer.unref?.();
 }
 
-export function extractCacheKey({ type, tmdb_id, season, episode }) {
+export function extractCacheKey({ type, tmdb_id, season, episode, profile = "full" }) {
   return JSON.stringify({
     type,
     tmdb_id: String(tmdb_id),
     season: season == null || season === "" ? null : String(season),
     episode: episode == null || episode === "" ? null : String(episode),
+    // "full" = classic /extract (Wyzie + sources). "vaplayer" = /extract/vaplayer
+    // (source subs only). Separate so subtitle lists don't bleed across routes.
+    profile: profile || "full",
   });
 }
 
