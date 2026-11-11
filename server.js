@@ -954,32 +954,31 @@ const SOURCE_PRIORITY = {
   nashville: 5,
 };
 
-// Re-point a finished /extract response at one specific source (the
-// ?source= pin). `mirrors` is left intact so the client still sees every
-// option. If the pin is missing but other mirrors work, fall back to the
-// best available stream instead of hard-failing (CDNs flake; refresh
-// shouldn't be required to play).
-function applySourceFilter(response, source, { allowFallback = true } = {}) {
-  if (!source || !response.success) return response;
-  // mirrors are quality-ranked; first match is that source's best tier.
-  const pick = response.mirrors.find((m) => m.source === source);
-  if (pick) {
-    return { ...response, hls_url: pick.hls_url, source: pick.source, quality: pick.quality, error: null };
-  }
-  if (allowFallback && response.hls_url && response.mirrors?.length) {
+// ?source= pin: return that provider only (hls_url + mirrors). One source at
+// a time — never leak the other providers into mirrors.
+function applySourceFilter(response, source) {
+  if (!source) return response;
+  const mirrors = (response.mirrors || []).filter((m) => m.source === source);
+  if (!mirrors.length) {
     return {
       ...response,
-      error: null,
-      fallback_from: source,
+      success: false,
+      hls_url: null,
+      mirrors: [],
+      source: null,
+      quality: null,
+      error: `No stream from source "${source}" for this title`,
     };
   }
+  const pick = mirrors[0];
   return {
     ...response,
-    success: false,
-    hls_url: null,
-    source: null,
-    quality: null,
-    error: `No stream from source "${source}" for this title`,
+    success: true,
+    hls_url: pick.hls_url,
+    source: pick.source,
+    quality: pick.quality,
+    mirrors,
+    error: null,
   };
 }
 function rankStreams(...streamLists) {
@@ -1449,10 +1448,25 @@ async function handleExtractRequest(req, res, { includeWyzie, profile }) {
   }
 
   const origin = `${req.protocol}://${req.get("host")}`;
-  const cacheKey = extractCacheKey({ type, tmdb_id, season, episode, profile });
+  const cacheKey = extractCacheKey({
+    type,
+    tmdb_id,
+    season,
+    episode,
+    profile,
+    source: wantedSource || null,
+  });
   const cached = getExtractCache(cacheKey);
   const now = Date.now();
-  const buildArgs = { type, tmdb_id, season, episode, origin, includeWyzie };
+  const buildArgs = {
+    type,
+    tmdb_id,
+    season,
+    episode,
+    origin,
+    includeWyzie,
+    onlySource: wantedSource || null,
+  };
 
   if (cached && cacheEntryFresh(cached, now)) {
     console.log(`[extract] cache hit ${cacheKey}`);
@@ -1617,8 +1631,20 @@ async function buildExtractResponse({
   episode,
   origin,
   includeWyzie = true,
+  onlySource = null,
 }) {
   try {
+    const pin = onlySource && onlySource in SOURCE_PRIORITY ? onlySource : null;
+    const want = (name) => !pin || pin === name;
+    const emptySrc = {
+      streams: [],
+      subtitles: [],
+      transient: false,
+      imdb_id: null,
+      title: null,
+      error: null,
+    };
+
     const wyziePromise = includeWyzie
       ? (
           type === "movie"
@@ -1632,20 +1658,33 @@ async function buildExtractResponse({
         })
       : Promise.resolve([]);
 
-    // No per-source budget: wait for every scraper. Cache + inflight coalesce
-    // keep repeat plays fast. Movy/flixhq/ophim/catflix key by TMDB S/E.
-    const movyPromise = scrapeMovy(type, tmdb_id, season, episode);
-    const flixhqPromise = scrapeFlixhq(type, tmdb_id, season, episode);
-    const ophimPromise = scrapeOphim(type, tmdb_id, season, episode);
-    const catflixPromise = scrapeCatflix(type, tmdb_id, season, episode);
+    // ?source= scrapes that provider only. Unpinned waits for every scraper.
+    const movyPromise = want("movy")
+      ? scrapeMovy(type, tmdb_id, season, episode)
+      : Promise.resolve(emptySrc);
+    const flixhqPromise = want("flixhq")
+      ? scrapeFlixhq(type, tmdb_id, season, episode)
+      : Promise.resolve(emptySrc);
+    const ophimPromise = want("ophim")
+      ? scrapeOphim(type, tmdb_id, season, episode)
+      : Promise.resolve(emptySrc);
+    const catflixPromise = want("catflix")
+      ? scrapeCatflix(type, tmdb_id, season, episode)
+      : Promise.resolve(emptySrc);
 
     const tmdbMetaPromise =
-      type === "tv" ? getTMDBEpisodeMeta(tmdb_id, season, episode).catch(() => null) : Promise.resolve(null);
+      type === "tv" && want("vaplayer")
+        ? getTMDBEpisodeMeta(tmdb_id, season, episode).catch(() => null)
+        : Promise.resolve(null);
     const resolvedEpisode =
-      type === "tv" ? await resolveTVEpisodeIndex(tmdb_id, season, episode) : episode;
+      type === "tv" && (want("vaplayer") || want("nashville"))
+        ? await resolveTVEpisodeIndex(tmdb_id, season, episode)
+        : episode;
 
     const [result, catflix, flixhq, ophim, movy, tmdbMeta] = await Promise.all([
-      scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode),
+      want("vaplayer") || want("nashville")
+        ? scrapeVaplayerAPI(type, tmdb_id, season, resolvedEpisode)
+        : Promise.resolve(emptySrc),
       catflixPromise,
       flixhqPromise,
       ophimPromise,
@@ -1655,13 +1694,22 @@ async function buildExtractResponse({
 
     const extractorSubs = Array.isArray(result.subtitles) ? result.subtitles : [];
     const flixhqSubs = Array.isArray(flixhq.subtitles) ? flixhq.subtitles : [];
-    const sourceSubs = [...extractorSubs, ...flixhqSubs];
+    const sourceSubs = pin
+      ? pin === "flixhq"
+        ? [...flixhqSubs]
+        : pin === "vaplayer"
+          ? [...extractorSubs]
+          : []
+      : [...extractorSubs, ...flixhqSubs];
     const wcands = await wyziePromise;
     const wyzieSubs = wcands.map(
       ({ downloadUrl, release }) => `${downloadUrl}&release=${encodeURIComponent(release)}`
     );
     const tmdbRefWords = tmdbEpisodeRefWords(tmdbMeta);
-    const vapUntrusted = await vaplayerPackMismatchesTmdb(extractorSubs, tmdbRefWords);
+    const vapUntrusted =
+      want("vaplayer") || want("nashville")
+        ? await vaplayerPackMismatchesTmdb(extractorSubs, tmdbRefWords)
+        : false;
     if (vapUntrusted) {
       console.warn(
         `[extract] vaplayer subtitle pack mismatches TMDB for ${type} ${tmdb_id}` +
@@ -1680,7 +1728,6 @@ async function buildExtractResponse({
       });
       subtitles = [...wyzieSubs, ...appendedSourceSubs];
     } else {
-      // /extract/vaplayer: source tracks only (same URL&release= shape).
       subtitles = [...sourceSubs];
     }
 
@@ -1688,23 +1735,32 @@ async function buildExtractResponse({
     const demotedVap = vapUntrusted ? result.streams : [];
     const vaplayerMissed = !result.streams?.length;
 
-    // Nashville = vapplayer fallback only (not a global last-resort). Remux
-    // removed — /hls-proxy already rewrites DASH MPDs.
-    const nashvilleStreams = vaplayerMissed
-      ? (await scrapeNashville(type, tmdb_id, season, episode)).streams || []
-      : [];
+    // Nashville = vapplayer fallback only (also when ?source=nashville).
+    const nashvilleStreams =
+      pin === "nashville" || ((!pin || pin === "vaplayer") && vaplayerMissed)
+        ? (await scrapeNashville(type, tmdb_id, season, episode)).streams || []
+        : [];
 
     let streams = [
       ...rankStreams(
-        vapStreams,
-        movy.streams,
-        catflix.streams,
-        flixhq.streams,
-        ophim.streams,
-        nashvilleStreams
+        pin && pin !== "vaplayer" ? [] : vapStreams,
+        pin && pin !== "movy" ? [] : movy.streams,
+        pin && pin !== "catflix" ? [] : catflix.streams,
+        pin && pin !== "flixhq" ? [] : flixhq.streams,
+        pin && pin !== "ophim" ? [] : ophim.streams,
+        pin && pin !== "nashville" && pin !== "vaplayer" ? [] : nashvilleStreams
       ),
-      ...demotedVap.map((s) => ({ ...s, source: "vaplayer" })),
+      ...(pin && pin !== "vaplayer"
+        ? []
+        : demotedVap.map((s) => ({ ...s, source: "vaplayer" }))),
     ];
+    if (pin === "vaplayer") {
+      streams = streams.filter(
+        (s) => s.source === "vaplayer" || s.source === "nashville"
+      );
+    } else if (pin) {
+      streams = streams.filter((s) => s.source === pin);
+    }
     const seenUrls = new Set();
     const uniqueStreams = streams.filter((s) => {
       if (seenUrls.has(s.url)) return false;
@@ -1718,7 +1774,8 @@ async function buildExtractResponse({
         `[extract] ${uniqueStreams.length} stream(s): ` +
           uniqueStreams.map((s) => `${s.source}@${qualityLabel(s) || "?"}`).join(", ") +
           (vapUntrusted ? " (vaplayer demoted)" : "") +
-          (includeWyzie ? "" : " [no-wyzie]")
+          (includeWyzie ? "" : " [no-wyzie]") +
+          (pin ? ` [pin=${pin}]` : "")
       );
     }
 
@@ -1739,7 +1796,7 @@ async function buildExtractResponse({
       mirrors.push({ hls_url: proxied(s), source: s.source, quality });
     }
 
-    if (subtitles.length === 0) {
+    if (subtitles.length === 0 && (!pin || pin === "vaplayer")) {
       if (type === "movie" && result.imdb_id) {
         try {
           const candidates = await findEnglishSubtitleZips(result.imdb_id, 10);
@@ -1753,7 +1810,12 @@ async function buildExtractResponse({
       } else if (type === "tv" && result.title) {
         let addic7edFailed = false;
         try {
-          const candidates = await findTVSubtitleCandidates(result.title, season, episode, 10);
+          const candidates = await findTVSubtitleCandidates(
+            result.title,
+            season,
+            episode,
+            10
+          );
           subtitles = candidates.map(
             ({ downloadUrl, release }) =>
               `${origin}/tv-subtitle-srt?url=${encodeURIComponent(downloadUrl)}&release=${encodeURIComponent(release)}`
@@ -1777,7 +1839,11 @@ async function buildExtractResponse({
       source: best ? best.source : null,
       quality: best ? qualityLabel(best) : null,
       subtitles,
-      error: best ? null : result.error || "No stream found",
+      error: best
+        ? null
+        : pin
+          ? `No stream from source "${pin}" for this title`
+          : result.error || "No stream found",
     };
     const transient = !!(
       catflix.transient ||
