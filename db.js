@@ -11,10 +11,20 @@ let clientPromise = null;
 export function connect() {
   if (!clientPromise) {
     if (!uri) throw new Error("MONGODB_URI is not set");
-    const client = new MongoClient(uri, {
+    const opts = {
       serverSelectionTimeoutMS: 8000,
       maxPoolSize: 10,
-    });
+    };
+    // UpCloud trial firewall blocks outbound 27017; optional SOCKS5 over an
+    // allowed port (e.g. 8080) reaches Atlas via the old allowlisted host.
+    if (process.env.MONGO_SOCKS_HOST) {
+      opts.proxyHost = process.env.MONGO_SOCKS_HOST;
+      opts.proxyPort = Number(process.env.MONGO_SOCKS_PORT || 1080);
+      console.log(
+        `[mongo] using SOCKS5 ${opts.proxyHost}:${opts.proxyPort}`
+      );
+    }
+    const client = new MongoClient(uri, opts);
     clientPromise = client.connect();
   }
   return clientPromise;
