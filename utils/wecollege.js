@@ -2,9 +2,24 @@
 // enc=2 payload that we decrypt with a short-lived /seed. Referer must be
 // https://www.movy.sx/ both for the API and for finalsignal CDN hosts.
 import fetch from "node-fetch";
+import { SocksProxyAgent } from "socks-proxy-agent";
 
 const STREAM_API = process.env.WECOLLEGE_API || "https://api.wecollege.net";
 const ORIGIN = "https://www.movy.sx";
+// UpCloud (and some other DC) IPs get CF 403 on api.wecollege.net. Optional
+// SOCKS5 (e.g. socks5://165.22.111.114:8080) relays seed/city calls.
+// Lazy: read env at call time so PM2/dotenv have already loaded .env.
+let movyAgent;
+let movyAgentUri;
+function getMovyAgent() {
+  const uri = process.env.MOVY_SOCKS || "";
+  if (!uri) return undefined;
+  if (movyAgent && movyAgentUri === uri) return movyAgent;
+  movyAgentUri = uri;
+  movyAgent = new SocksProxyAgent(uri);
+  console.log(`[movy] API via SOCKS ${uri}`);
+  return movyAgent;
+}
 const MAGIC = Buffer.from([109, 118, 109, 49]); // "mvm1"
 const SHA_WORDS = [
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -127,8 +142,10 @@ async function fetchSeed(mediaId, timeoutMs) {
       ? setTimeout(() => controller.abort(), timeoutMs)
       : null;
   try {
+    const agent = getMovyAgent();
     const res = await fetch(`${STREAM_API}/seed?mediaId=${encodeURIComponent(mediaId)}`, {
       headers: API_HEADERS,
+      ...(agent ? { agent } : {}),
       ...(controller ? { signal: controller.signal } : {}),
     });
     if (!res.ok) throw new Error(`seed ${res.status}`);
@@ -157,8 +174,10 @@ async function fetchCitySources(city, params, mediaId, seed, timeoutMs) {
       if (v == null || v === "") continue;
       url.searchParams.set(k, String(v));
     }
+    const agent = getMovyAgent();
     const res = await fetch(url, {
       headers: API_HEADERS,
+      ...(agent ? { agent } : {}),
       ...(controller ? { signal: controller.signal } : {}),
     });
     const text = await res.text();

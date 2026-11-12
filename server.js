@@ -26,6 +26,7 @@ import {
 } from "./utils/opensubtitles.js";
 import { registerSyncRoutes, requireAuth, requirePremium } from "./srctvSync.js";
 import { fetchCatflixStream, fetchFlixhqStreams, fetchOphimStreams } from "./utils/catflix.js";
+import { SocksProxyAgent } from "socks-proxy-agent";
 import { fetchMovyStreams, NASHVILLE_CITY } from "./utils/wecollege.js";
 import {
   loadExtractCache,
@@ -150,7 +151,7 @@ const MOVY_UPSTREAM_HEADERS = {
     "application/vnd.apple.mpegurl,application/x-mpegURL,application/dash+xml,application/xml,*/*",
 };
 UPSTREAM_HEADER_RULES.push({
-  test: /(^|\.)(finalsignal\.top|goldenkite\.top|pulseatom\.top|wellsrobertsonkmlt\.workers\.dev)$/i,
+  test: /(^|\.)(finalsignal\.top|goldenkite\.top|pulseatom\.top|greenkite\.top|vividstone\.top|wellsrobertsonkmlt\.workers\.dev)$/i,
   headers: MOVY_UPSTREAM_HEADERS,
 });
 // Everything else — vaplayer mirrors and the Cloudflare Workers fronting
@@ -172,14 +173,43 @@ const upstreamAgents = {
 };
 const upstreamAgent = (url) => upstreamAgents[url.protocol] || upstreamAgents["https:"];
 
+// Same SOCKS as wecollege seed — Movy CDNs also CF-403 UpCloud's IP.
+let movySocksAgent;
+function getMovySocksAgent() {
+  const uri = process.env.MOVY_SOCKS || "";
+  if (!uri) return null;
+  if (!movySocksAgent) {
+    movySocksAgent = new SocksProxyAgent(uri);
+    console.log(`[hls-proxy] Movy CDN via SOCKS ${uri}`);
+  }
+  return movySocksAgent;
+}
+
+function isMovyUpstream(url, cdnHint, headers) {
+  if (cdnHint === "movy") return true;
+  if (headers?.Referer === MOVY_UPSTREAM_HEADERS.Referer) return true;
+  try {
+    const u = new URL(url);
+    return (
+      /\.top$/i.test(u.hostname) &&
+      (/^\/(vd|vdb|r6|fine)\b/i.test(u.pathname) || /\.(m4s|m3u8|mpd)$/i.test(u.pathname))
+    );
+  } catch {
+    return false;
+  }
+}
+
 // Fetch an upstream URL with the right per-host / per-cdn headers and the
 // shared agent. `cdnHint` (e.g. "movy") wins over host heuristics.
 function fetchUpstream(url, init = {}) {
   const { cdnHint, headers: extraHeaders, ...rest } = init;
+  const headers = { ...upstreamHeadersFor(url, cdnHint), ...(extraHeaders || {}) };
+  const socks =
+    isMovyUpstream(url, cdnHint, headers) ? getMovySocksAgent() : null;
   return fetch(url, {
     ...rest,
-    headers: { ...upstreamHeadersFor(url, cdnHint), ...(extraHeaders || {}) },
-    agent: upstreamAgent,
+    headers,
+    agent: socks || upstreamAgent,
   });
 }
 
@@ -959,9 +989,14 @@ const SOURCE_PRIORITY = {
 
 // ?source= pin: return that provider only (hls_url + mirrors). One source at
 // a time — never leak the other providers into mirrors.
+// vaplayer pin also accepts nashville (vaplayer-only fallback).
 function applySourceFilter(response, source) {
   if (!source) return response;
-  const mirrors = (response.mirrors || []).filter((m) => m.source === source);
+  const mirrors = (response.mirrors || []).filter((m) =>
+    source === "vaplayer"
+      ? m.source === "vaplayer" || m.source === "nashville"
+      : m.source === source
+  );
   if (!mirrors.length) {
     return {
       ...response,
