@@ -61,18 +61,21 @@ app.use(cors());
 app.use(json({ limit: "64kb" }));
 
 // Surge / cost protection: cap noisy clients before they reach scrapers.
-// /hls-proxy is intentionally looser (many segment requests per viewer).
+// Playback / subtitle / sync traffic is high-frequency and cheap compared to
+// scrapes — skip those so a single viewer (or NAT) doesn't trip 429s.
+const GLOBAL_LIMIT_SKIP =
+  /^\/(hls-proxy|subtitle-proxy|movie-subtitle-|tv-subtitle-|wyzie-subtitle-srt|opensubtitles\/srt|segments|progress|library|subtitle-prefs|recommendations)(\/|$)/;
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: 120,
+  limit: 600,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests, please slow down" },
-  skip: (req) => req.path === "/hls-proxy",
+  skip: (req) => GLOBAL_LIMIT_SKIP.test(req.path),
 });
 const extractLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: 20,
+  limit: 60,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Extract rate limit exceeded" },
