@@ -930,7 +930,7 @@ async function probeManifestAlive(url, timeoutMs = 10000) {
   }
 }
 
-// Movy "Nashville" city — vapplayer-only fallback (not a global last resort).
+// Movy "Nashville" city — only used for ?source=nashville (no auto-fallback).
 // Often finds Asian dramas other extractors miss; returns finalsignal DASH
 // labeled "Auto". Served via /hls-proxy (no ffmpeg remux).
 async function scrapeNashville(type, tmdb_id, season, episode) {
@@ -959,7 +959,7 @@ async function scrapeNashville(type, tmdb_id, season, episode) {
         pixels: 1920 * 1080,
       }));
     if (!streams.length) console.warn(`[nashville] no usable stream for ${type} ${tmdb_id}`);
-    else console.log(`[nashville] fallback hit ${type} ${tmdb_id}: ${streams.length} stream(s)`);
+    else console.log(`[nashville] hit ${type} ${tmdb_id}: ${streams.length} stream(s)`);
     return { streams, subtitles: [], transient: streams.length === 0 };
   } catch (error) {
     console.error(`[nashville] ${error.message}`);
@@ -983,20 +983,15 @@ const SOURCE_PRIORITY = {
   flixhq: 2,
   catflix: 3,
   ophim: 4,
-  // Only injected when every other source missed (see scrapeNashville).
+  // Explicit ?source=nashville only (no auto-fallback).
   nashville: 5,
 };
 
 // ?source= pin: return that provider only (hls_url + mirrors). One source at
 // a time — never leak the other providers into mirrors.
-// vaplayer pin also accepts nashville (vaplayer-only fallback).
 function applySourceFilter(response, source) {
   if (!source) return response;
-  const mirrors = (response.mirrors || []).filter((m) =>
-    source === "vaplayer"
-      ? m.source === "vaplayer" || m.source === "nashville"
-      : m.source === source
-  );
+  const mirrors = (response.mirrors || []).filter((m) => m.source === source);
   if (!mirrors.length) {
     return {
       ...response,
@@ -1583,8 +1578,8 @@ async function handleExtractRequest(req, res, { includeWyzie, profile }) {
   }
 }
 
-// Classic extract: vapplayer/movy/flixhq/catflix/ophim (+ nashville as
-// vapplayer-only fallback), Wyzie + source subtitles, mirrors.
+// Classic extract: vapplayer/movy/flixhq/catflix/ophim (nashville via
+// ?source=nashville only), Wyzie + source subtitles, mirrors.
 app.get("/extract", ...requirePremiumAccess, extractLimiter, (req, res) =>
   handleExtractRequest(req, res, { includeWyzie: true, profile: "full" })
 );
@@ -1771,11 +1766,10 @@ async function buildExtractResponse({
 
     const vapStreams = vapUntrusted ? [] : result.streams;
     const demotedVap = vapUntrusted ? result.streams : [];
-    const vaplayerMissed = !result.streams?.length;
 
-    // Nashville = vapplayer fallback only (also when ?source=nashville).
+    // Nashville only when explicitly pinned (?source=nashville) — no vapplayer fallback.
     const nashvilleStreams =
-      pin === "nashville" || ((!pin || pin === "vaplayer") && vaplayerMissed)
+      pin === "nashville"
         ? (await scrapeNashville(type, tmdb_id, season, episode)).streams || []
         : [];
 
@@ -1786,17 +1780,13 @@ async function buildExtractResponse({
         pin && pin !== "catflix" ? [] : catflix.streams,
         pin && pin !== "flixhq" ? [] : flixhq.streams,
         pin && pin !== "ophim" ? [] : ophim.streams,
-        pin && pin !== "nashville" && pin !== "vaplayer" ? [] : nashvilleStreams
+        pin === "nashville" ? nashvilleStreams : []
       ),
       ...(pin && pin !== "vaplayer"
         ? []
         : demotedVap.map((s) => ({ ...s, source: "vaplayer" }))),
     ];
-    if (pin === "vaplayer") {
-      streams = streams.filter(
-        (s) => s.source === "vaplayer" || s.source === "nashville"
-      );
-    } else if (pin) {
+    if (pin) {
       streams = streams.filter((s) => s.source === pin);
     }
     const seenUrls = new Set();
