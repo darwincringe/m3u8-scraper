@@ -7,12 +7,15 @@ import { SocksProxyAgent } from "socks-proxy-agent";
 const STREAM_API = process.env.WECOLLEGE_API || "https://api.wecollege.net";
 const ORIGIN = "https://www.movy.sx";
 // UpCloud (and some other DC) IPs get CF 403 on api.wecollege.net. Optional
-// SOCKS5 (e.g. socks5://165.22.111.114:8080) relays seed/city calls.
+// SOCKS5 (e.g. socks5h://165.22.111.114:8080) relays seed/city calls.
+// Force socks5h so DNS runs on the relay — local AAAA lookup + socks5://
+// yields NetworkUnreachable on IPv6-only paths through the DO hop.
 // Lazy: read env at call time so PM2/dotenv have already loaded .env.
 let movyAgent;
 let movyAgentUri;
 function getMovyAgent() {
-  const uri = process.env.MOVY_SOCKS || "";
+  const raw = process.env.MOVY_SOCKS || "";
+  const uri = raw.replace(/^socks5:\/\//i, "socks5h://");
   if (!uri) return undefined;
   if (movyAgent && movyAgentUri === uri) return movyAgent;
   movyAgentUri = uri;

@@ -151,7 +151,7 @@ const MOVY_UPSTREAM_HEADERS = {
     "application/vnd.apple.mpegurl,application/x-mpegURL,application/dash+xml,application/xml,*/*",
 };
 UPSTREAM_HEADER_RULES.push({
-  test: /(^|\.)(finalsignal\.top|goldenkite\.top|pulseatom\.top|greenkite\.top|vividstone\.top|wellsrobertsonkmlt\.workers\.dev)$/i,
+  test: /(^|\.)(finalsignal\.top|goldenkite\.top|pulseatom\.top|greenkite\.top|vividstone\.top|keenatom\.top|wellsrobertsonkmlt\.workers\.dev)$/i,
   headers: MOVY_UPSTREAM_HEADERS,
 });
 // Everything else — vaplayer mirrors and the Cloudflare Workers fronting
@@ -174,11 +174,18 @@ const upstreamAgents = {
 const upstreamAgent = (url) => upstreamAgents[url.protocol] || upstreamAgents["https:"];
 
 // Same SOCKS as wecollege seed — Movy CDNs also CF-403 UpCloud's IP.
+// Prefer socks5h (remote DNS): local socks5:// resolves AAAA first and the
+// DO relay returns NetworkUnreachable on IPv6 (keenatom.top, etc.).
 let movySocksAgent;
+let movySocksAgentUri;
+function normalizeMovySocksUri(uri) {
+  return String(uri || "").replace(/^socks5:\/\//i, "socks5h://");
+}
 function getMovySocksAgent() {
-  const uri = process.env.MOVY_SOCKS || "";
+  const uri = normalizeMovySocksUri(process.env.MOVY_SOCKS);
   if (!uri) return null;
-  if (!movySocksAgent) {
+  if (!movySocksAgent || movySocksAgentUri !== uri) {
+    movySocksAgentUri = uri;
     movySocksAgent = new SocksProxyAgent(uri);
     console.log(`[hls-proxy] Movy CDN via SOCKS ${uri}`);
   }
