@@ -1739,15 +1739,24 @@ async function handleExtractRequest(req, res, { includeWyzie, profile }) {
 
 // Classic extract: vapplayer/movy/flixhq/catflix/ophim (nashville via
 // ?source=nashville only), Wyzie + source subtitles, mirrors.
-app.get("/extract", ...requirePremiumAccess, extractLimiter, (req, res) =>
-  handleExtractRequest(req, res, { includeWyzie: true, profile: "full" })
+// Mounted router: Express 5 was registering `/extract/vapplayer` on app.get
+// but never matching it (404). A sub-router matches cleanly.
+const extractRouter = express.Router();
+extractRouter.get(
+  "/",
+  ...requirePremiumAccess,
+  extractLimiter,
+  (req, res) => handleExtractRequest(req, res, { includeWyzie: true, profile: "full" })
 );
-
 // Stream extract without Wyzie — source/YIFY/addic7ed subtitles only.
-// Same response shape (hls_url, mirrors, subtitles with &release=).
-app.get("/extract/vaplayer", ...requirePremiumAccess, extractLimiter, (req, res) =>
-  handleExtractRequest(req, res, { includeWyzie: false, profile: "vaplayer" })
+extractRouter.get(
+  "/vapplayer",
+  ...requirePremiumAccess,
+  extractLimiter,
+  (req, res) =>
+    handleExtractRequest(req, res, { includeWyzie: false, profile: "vapplayer" })
 );
+app.use("/extract", extractRouter);
 
 // English-only Wyzie subtitle list. Same URL&release= strings as extract.subtitles.
 app.get("/wyzie", ...requirePremiumAccess, extractLimiter, async (req, res) => {
