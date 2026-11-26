@@ -1739,24 +1739,24 @@ async function handleExtractRequest(req, res, { includeWyzie, profile }) {
 
 // Classic extract: vapplayer/movy/flixhq/catflix/ophim (nashville via
 // ?source=nashville only), Wyzie + source subtitles, mirrors.
-// Mounted router: Express 5 was registering `/extract/vapplayer` on app.get
-// but never matching it (404). A sub-router matches cleanly.
-const extractRouter = express.Router();
-extractRouter.get(
-  "/",
+// Express 5 + path-to-regexp v8: string path "/extract/vapplayer" can register
+// but never match (HTML 404 "Cannot GET /extract/vapplayer"). Use regex paths.
+const handleExtractFull = (req, res) =>
+  handleExtractRequest(req, res, { includeWyzie: true, profile: "full" });
+const handleExtractVaplayer = (req, res) =>
+  handleExtractRequest(req, res, { includeWyzie: false, profile: "vaplayer" });
+app.get(
+  /^\/extract\/?$/,
   ...requirePremiumAccess,
   extractLimiter,
-  (req, res) => handleExtractRequest(req, res, { includeWyzie: true, profile: "full" })
+  handleExtractFull
 );
-// Stream extract without Wyzie — source/YIFY/addic7ed subtitles only.
-extractRouter.get(
-  "/vapplayer",
+app.get(
+  /^\/extract\/vapplayer\/?$/,
   ...requirePremiumAccess,
   extractLimiter,
-  (req, res) =>
-    handleExtractRequest(req, res, { includeWyzie: false, profile: "vapplayer" })
+  handleExtractVaplayer
 );
-app.use("/extract", extractRouter);
 
 // English-only Wyzie subtitle list. Same URL&release= strings as extract.subtitles.
 app.get("/wyzie", ...requirePremiumAccess, extractLimiter, async (req, res) => {
