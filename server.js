@@ -1737,10 +1737,10 @@ async function handleExtractRequest(req, res, { includeWyzie, profile }) {
   }
 }
 
-// Classic extract: vapplayer/movy/flixhq/catflix/ophim (nashville via
+// Classic extract: vaplayer/movy/flixhq/catflix/ophim (nashville via
 // ?source=nashville only), Wyzie + source subtitles, mirrors.
-// Express 5 + path-to-regexp v8: string path "/extract/vapplayer" can register
-// but never match (HTML 404 "Cannot GET /extract/vapplayer"). Use regex paths.
+// Express 5 + path-to-regexp v8: string path "/extract/vaplayer" can register
+// but never match (HTML 404 "Cannot GET /extract/vaplayer"). Use regex paths.
 const handleExtractFull = (req, res) =>
   handleExtractRequest(req, res, { includeWyzie: true, profile: "full" });
 const handleExtractVaplayer = (req, res) =>
@@ -1752,7 +1752,7 @@ app.get(
   handleExtractFull
 );
 app.get(
-  /^\/extract\/vapplayer\/?$/,
+  /^\/extract\/vaplayer\/?$/,
   ...requirePremiumAccess,
   extractLimiter,
   handleExtractVaplayer
@@ -1873,7 +1873,7 @@ async function buildExtractResponse({
       ? scrapeCatflix(type, tmdb_id, season, episode)
       : Promise.resolve(emptySrc);
 
-    // Runtime meta is needed for every TV extract (not just vapplayer) so we
+    // Runtime meta is needed for every TV extract (not just vaplayer) so we
     // can reject provider mis-indexes whose HLS length is nowhere near TMDB.
     const tmdbMetaPromise =
       type === "tv"
@@ -1937,7 +1937,7 @@ async function buildExtractResponse({
     const vapStreams = vapUntrusted ? [] : result.streams;
     const demotedVap = vapUntrusted ? result.streams : [];
 
-    // Nashville only when explicitly pinned (?source=nashville) — no vapplayer fallback.
+    // Nashville only when explicitly pinned (?source=nashville) — no vaplayer fallback.
     const nashvilleStreams =
       pin === "nashville"
         ? (await scrapeNashville(type, tmdb_id, season, episode)).streams || []
