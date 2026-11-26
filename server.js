@@ -199,10 +199,20 @@ function isMovyUpstream(url, cdnHint, headers) {
     const u = new URL(url);
     return (
       /\.top$/i.test(u.hostname) &&
-      (/^\/(vd|vdb|r6|fine)\b/i.test(u.pathname) || /\.(m4s|m3u8|mpd)$/i.test(u.pathname))
+      (/^\/(vd|vdb|r6|fine|res)\b/i.test(u.pathname) || /\.(m4s|m3u8|mpd)$/i.test(u.pathname))
     );
   } catch {
     return false;
+  }
+}
+
+// CF Workers egress already passes WAF; tunneling them through our WSL SOCKS
+// only adds latency and stalls parallel Movy probes. Keep SOCKS for *.top CDNs.
+function movyNeedsSocks(url) {
+  try {
+    return !/\.workers\.dev$/i.test(new URL(url).hostname);
+  } catch {
+    return true;
   }
 }
 
@@ -212,7 +222,9 @@ function fetchUpstream(url, init = {}) {
   const { cdnHint, headers: extraHeaders, ...rest } = init;
   const headers = { ...upstreamHeadersFor(url, cdnHint), ...(extraHeaders || {}) };
   const socks =
-    isMovyUpstream(url, cdnHint, headers) ? getMovySocksAgent() : null;
+    isMovyUpstream(url, cdnHint, headers) && movyNeedsSocks(url)
+      ? getMovySocksAgent()
+      : null;
   return fetch(url, {
     ...rest,
     headers,
@@ -583,10 +595,110 @@ async function getTMDBEpisodeMeta(tmdb_id, season, episode) {
     return {
       name: json?.name || null,
       overview: json?.overview || null,
+      runtime: Number(json?.runtime) > 0 ? Number(json.runtime) : null,
     };
   } catch {
     return null;
   }
+}
+
+// Sum #EXTINF on an HLS media playlist (follows one master variant when
+// needed). Used to drop provider mis-indexes — e.g. Always Sunny S6E13
+// "A Very Sunny Christmas" is 43m on TMDB but flixhq/miami often hand back
+// a ~20m regular episode under that slot.
+async function measureHlsDurationSec(url, cdnHint, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchUpstream(url, {
+      signal: controller.signal,
+      cdnHint,
+    });
+    if (!res.ok) {
+      discardBody(res);
+      return null;
+    }
+    const text = await res.text();
+    if (!text.trimStart().startsWith("#EXTM3U")) return null;
+    const lines = text.split(/\r?\n/);
+    if (text.includes("#EXT-X-STREAM-INF")) {
+      let variant = null;
+      for (let i = 0; i < lines.length; i++) {
+        if (!lines[i].startsWith("#EXT-X-STREAM-INF")) continue;
+        let j = i + 1;
+        while (j < lines.length && (!lines[j].trim() || lines[j].startsWith("#"))) j++;
+        if (j < lines.length) {
+          variant = lines[j].trim();
+          break;
+        }
+      }
+      if (!variant) return null;
+      let abs;
+      try {
+        abs = new URL(variant, url).toString();
+      } catch {
+        return null;
+      }
+      return measureHlsDurationSec(abs, cdnHint, timeoutMs);
+    }
+    let sec = 0;
+    let n = 0;
+    for (const line of lines) {
+      const m = /^#EXTINF:([0-9.]+)/.exec(line);
+      if (!m) continue;
+      sec += parseFloat(m[1]);
+      n++;
+    }
+    return n > 0 ? sec : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function durationMatchesRuntime(durationSec, runtimeMin) {
+  if (!(runtimeMin > 0) || !(durationSec > 0)) return true;
+  const ratio = durationSec / (runtimeMin * 60);
+  return ratio >= 0.65 && ratio <= 1.4;
+}
+
+async function filterStreamsByRuntime(streams, runtimeMin) {
+  if (!(runtimeMin > 0) || !streams?.length) return streams || [];
+  // Long episodes / specials (Christmas eps, etc.) are where providers most
+  // often mis-index a regular ~20m slot. Require a measured duration there;
+  // for normal lengths, keep streams whose duration we couldn't read.
+  const requireMeasured = runtimeMin >= 35;
+  const kept = await Promise.all(
+    streams.map(async (s) => {
+      const cdnHint =
+        s.source === "movy" || s.source === "nashville"
+          ? "movy"
+          : s.source === "catflix"
+            ? "catflix"
+            : undefined;
+      const dur = await measureHlsDurationSec(s.url, cdnHint);
+      if (dur == null) {
+        if (requireMeasured) {
+          console.warn(
+            `[runtime] drop ${s.source}@${qualityLabel(s) || "?"} ` +
+              `unmeasured vs TMDB ${runtimeMin}m`
+          );
+          return null;
+        }
+        return s;
+      }
+      if (!durationMatchesRuntime(dur, runtimeMin)) {
+        console.warn(
+          `[runtime] drop ${s.source}@${qualityLabel(s) || "?"} ` +
+            `${(dur / 60).toFixed(1)}m vs TMDB ${runtimeMin}m`
+        );
+        return null;
+      }
+      return s;
+    })
+  );
+  return kept.filter(Boolean);
 }
 
 const EPISODE_SEARCH_RADIUS = 8;
@@ -881,9 +993,19 @@ async function scrapeMovy(type, tmdb_id, season, episode) {
     const result = await fetchMovyStreams(type, tmdb_id, season, episode, meta, 0);
     // Probe everything Movy returns (incl. lower tiers) so we can fall back
     // to the highest available when 1080/2160 are missing.
-    const candidates = (result?.streams || [])
-      .filter((s) => s?.url && !/\.json(\?|$)/i.test(s.url))
-      .slice(0, 12);
+    const rawCandidates = (result?.streams || []).filter(
+      (s) => s?.url && !/\.json(\?|$)/i.test(s.url)
+    );
+    // Probe Auto / workers.dev first — for specials those are often the only
+    // city with the correct runtime while peer "1080p" slots are mis-indexed.
+    const candidates = [
+      ...rawCandidates.filter(
+        (s) => /auto/i.test(s.quality || "") || /\.workers\.dev/i.test(s.url)
+      ),
+      ...rawCandidates.filter(
+        (s) => !(/auto/i.test(s.quality || "") || /\.workers\.dev/i.test(s.url))
+      ),
+    ].slice(0, 12);
     if (!candidates.length) return { streams: [], subtitles: [], transient: false };
 
     // Prefer probe-measured RESOLUTION when present; otherwise keep Movy's
@@ -891,15 +1013,45 @@ async function scrapeMovy(type, tmdb_id, season, episode) {
     const claimedByUrl = new Map(candidates.map((s) => [s.url, s.quality]));
     const probed = await probeStreamUrls(
       candidates.map((s) => s.url),
-      8000,
-      1
+      20000,
+      2
     );
     const labeled = probed.map((s) => {
       if (s.width || s.height) return { ...s, source: "movy" };
       const claimed = claimedQualityDims(claimedByUrl.get(s.url));
       return claimed ? { ...s, ...claimed, source: "movy" } : { ...s, source: "movy" };
     });
-    const streams = selectMovyQualities(labeled);
+    // Auto / workers.dev masters sometimes fail the strict "all variants
+    // dead" probe (CDN hops 403 under parallel load) even though the master
+    // itself is fine and /hls-proxy can play it. Soft-accept those when the
+    // playlist body is clearly M3U8 so runtime filtering can still pick the
+    // correct special (Always Sunny S6E13 ≈ 43m on chicago/reno Auto).
+    const seen = new Set(labeled.map((s) => s.url));
+    const softAuto = candidates.filter(
+      (s) =>
+        !seen.has(s.url) &&
+        (/auto/i.test(s.quality || "") || /\.workers\.dev/i.test(s.url))
+    );
+    await Promise.all(
+      softAuto.map(async (s) => {
+        const text = await fetchPlaylistText(s.url, 20000, 2);
+        if (!text) return;
+        const claimed = claimedQualityDims(s.quality) || {
+          width: 1920,
+          height: 1080,
+          pixels: 1920 * 1080,
+        };
+        labeled.push({ url: s.url, ...claimed, source: "movy" });
+      })
+    );
+    // Keep Auto / lower tiers too — runtime filtering + rankStreams decide.
+    const preferred = selectMovyQualities(labeled);
+    const streams = preferred.length
+      ? [
+          ...preferred,
+          ...labeled.filter((s) => !preferred.some((p) => p.url === s.url)),
+        ]
+      : labeled;
     if (!streams.length) console.warn(`[movy] manifest unreachable for ${type} ${tmdb_id}`);
     return {
       streams,
@@ -1712,8 +1864,10 @@ async function buildExtractResponse({
       ? scrapeCatflix(type, tmdb_id, season, episode)
       : Promise.resolve(emptySrc);
 
+    // Runtime meta is needed for every TV extract (not just vapplayer) so we
+    // can reject provider mis-indexes whose HLS length is nowhere near TMDB.
     const tmdbMetaPromise =
-      type === "tv" && want("vaplayer")
+      type === "tv"
         ? getTMDBEpisodeMeta(tmdb_id, season, episode).catch(() => null)
         : Promise.resolve(null);
     const resolvedEpisode =
@@ -1795,6 +1949,9 @@ async function buildExtractResponse({
     ];
     if (pin) {
       streams = streams.filter((s) => s.source === pin);
+    }
+    if (type === "tv" && tmdbMeta?.runtime) {
+      streams = await filterStreamsByRuntime(streams, tmdbMeta.runtime);
     }
     const seenUrls = new Set();
     const uniqueStreams = streams.filter((s) => {
