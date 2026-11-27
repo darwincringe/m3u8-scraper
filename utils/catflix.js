@@ -1,16 +1,14 @@
 // Stream sources behind the vidnest.fun embed (one of the six players
 // hurawatch.cz iframes). vidnest's frontend offers a dozen backends, all
-// served from https://new.vidnest.fun/<backend>/{movie|tv}/... behind the
-// same auth/envelope (see below). We use three of them:
+// served from https://promox.vidnest.fun/<backend>/{movie|tv}/... behind the
+// same auth/envelope (see below). (Host was new.vidnest.fun until ~Nov 2026;
+// that origin now 522s.) We use three of them:
 //
-// - "Catflix" (/yflix): good 1080p encodes but spotty coverage. Decoded
-//   JSON is {url, headers}; url is an HLS master (usually proxied through
-//   pwcloud.animanga.fun/hls/<base64 upstream>/master.m3u8), segments on
-//   tiktokcdn.com disguised as PNGs.
-// - "flixhq" (/flixhq, vidnest's "Beta"): {url, quality: "auto", subtitles}
-//   where url is a master on a Cloudflare Worker (*.workers.dev) that
-//   proxies the real CDN. Widest coverage of the three, highest bitrates
-//   (1080p ~6-8 Mbps, 2160p on some films), and 10-90 MB/s from our host.
+// - "Catflix": prefers /yflix ({url, headers} on animanga/tiktokcdn), falls
+//   back to /moviebox ({streams:[{url,quality}]} on media.bigbang.observer).
+// - "flixhq": prefers /flixhq (often dead/502), falls back to /purstream
+//   (vidnest "Beta") which returns Movy-proxied HLS via /movy/pl/... — rewrite
+//   new.vidnest.fun → promox so the wrapper still answers.
 // - "ophim" (/ophim, vidnest's "Lamda", aoneroom upstream): {streams:
 //   [{language, quality, type, url}]} — one master per audio language, also
 //   behind a Worker. Same speed class as flixhq, slightly less coverage.
@@ -21,7 +19,23 @@
 import fetch from "node-fetch";
 import crypto from "crypto";
 
-const API_BASE = "https://new.vidnest.fun";
+// Current API host from vidnest's player bundle (promox.*). Keep the old
+// host as a fallback in case they flip back. Override with VIDNEST_API_BASE
+// (comma-separated) if they rotate again.
+const API_BASES = (
+  process.env.VIDNEST_API_BASE || "https://promox.vidnest.fun,https://new.vidnest.fun"
+)
+  .split(",")
+  .map((s) => s.trim().replace(/\/$/, ""))
+  .filter(Boolean);
+const API_BASE = API_BASES[0] || "https://promox.vidnest.fun";
+
+// Purstream (and some other backends) still mint playlist wrappers on the
+// retired new.vidnest.fun host; promox serves the same /movy/pl/ path.
+function rewriteVidnestUrl(url) {
+  if (typeof url !== "string") return url;
+  return url.replace(/^https?:\/\/new\.vidnest\.fun(?=\/)/i, API_BASE);
+}
 
 // Since Oct 2026 the API rejects calls without a `_n` query param (403
 // "missing or invalid nonce") and answers in a "v2" envelope
@@ -45,20 +59,16 @@ function decryptV2(d, n) {
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
 }
 
-// new.vidnest.fun sits behind a Cloudflare WAF rule that hard-blocks
-// datacenter IPs (403 "Sorry, you have been blocked" for DigitalOcean etc.),
-// while the stream CDN it points at is open. Requests from Cloudflare Workers
-// egress via Cloudflare's own network and pass that rule, so when the direct
-// call is blocked we retry through a fetch-proxy Worker. CATFLIX_RELAY is a
-// comma-separated list of URL prefixes (the target URL is appended,
-// URL-encoded), tried in order — put our own relay (relay/vidnest-relay.
-// worker.js) first and any third-party one after it as a spare. The
-// default is the generic worker vidnest's own page uses, which went dark
-// on 2026-10-15 (error 1101 on every call) and took every vidnest source
-// down with it, so don't run prod on the default alone. "off" disables the
-// fallback. CATFLIX_RELAY_KEY is sent as X-Relay-Key for relays that want
-// one.
-const RELAY_PREFIXES = (process.env.CATFLIX_RELAY || "https://fetch.streaming-1.workers.dev/fetch?url=")
+// Datacenter IPs sometimes get CF WAF 403 on the vidnest API; the stream CDN
+// it points at is open. Requests from Cloudflare Workers egress via CF's own
+// network and pass that rule, so when the direct call is blocked we retry
+// through a fetch-proxy Worker. CATFLIX_RELAY is a comma-separated list of
+// URL prefixes (the target URL is appended, URL-encoded), tried in order —
+// put our own relay (relay/vidnest-relay.worker.js) first. Default public
+// relay went dark 2026-10-15; leave CATFLIX_RELAY empty/"off" when the
+// current host (promox) answers the droplet directly. CATFLIX_RELAY_KEY is
+// sent as X-Relay-Key for relays that want one.
+const RELAY_PREFIXES = (process.env.CATFLIX_RELAY || "off")
   .split(",")
   .map((s) => s.trim())
   .filter((s) => s && s !== "off");
@@ -168,13 +178,73 @@ async function fetchVidnestPayload(path, timeoutMs) {
 }
 const inflight = new Map();
 
-// Catflix: returns { url, headers } or null when the source has nothing
-// for this title.
+// Try backends in order. Catalogue misses (404/502) advance to the next;
+// other errors (rate-limit, decrypt, network) abort immediately.
+async function fetchFirstBackend(backends, type, tmdb_id, season, episode, timeoutMs) {
+  let lastNoEntry = null;
+  for (const backend of backends) {
+    try {
+      return await fetchVidnestPayload(titlePath(backend, type, tmdb_id, season, episode), timeoutMs);
+    } catch (error) {
+      if (isNoEntry(error)) {
+        lastNoEntry = error;
+        continue;
+      }
+      throw error;
+    }
+  }
+  if (lastNoEntry) throw lastNoEntry;
+  return null;
+}
+
+function qualityRank(q) {
+  const m = String(q || "").match(/(\d{3,4})/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+// Normalize either legacy {url, headers} or {streams:[{url,quality,headers}]}
+// into { urls (best quality first), headers, subtitles }.
+function normalizeStreamPayload(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const subtitles = Array.isArray(payload.subtitles) ? payload.subtitles : [];
+  if (typeof payload.url === "string" && /^https?:\/\//i.test(payload.url.trim())) {
+    return {
+      urls: [rewriteVidnestUrl(payload.url.trim())],
+      headers: payload.headers || {},
+      subtitles,
+    };
+  }
+  const list = (Array.isArray(payload.streams) ? payload.streams : [])
+    .filter((s) => typeof s?.url === "string" && /^https?:\/\//i.test(s.url.trim()))
+    .filter((s) => !s.type || /hls|m3u8/i.test(s.type))
+    .map((s) => ({ ...s, url: rewriteVidnestUrl(s.url.trim()) }))
+    .sort((a, b) => qualityRank(b.quality) - qualityRank(a.quality));
+  if (!list.length) return null;
+  return {
+    urls: list.map((s) => s.url),
+    headers: list[0].headers || payload.headers || {},
+    subtitles,
+  };
+}
+
+// Catflix: returns { url, headers, subtitles } or null when the source has
+// nothing for this title. Tries /yflix then /moviebox.
 export async function fetchCatflixStream(type, tmdb_id, season, episode, timeoutMs = 0) {
-  const payload = await fetchVidnestPayload(titlePath("yflix", type, tmdb_id, season, episode), timeoutMs);
-  const url = typeof payload?.url === "string" ? payload.url.trim() : "";
-  if (!/^https?:\/\//i.test(url)) return null;
-  return { url, headers: payload.headers || {} };
+  const payload = await fetchFirstBackend(
+    ["yflix", "moviebox"],
+    type,
+    tmdb_id,
+    season,
+    episode,
+    timeoutMs
+  );
+  const normalized = normalizeStreamPayload(payload);
+  if (!normalized?.urls?.length) return null;
+  return {
+    url: normalized.urls[0],
+    headers: normalized.headers,
+    subtitles: normalized.subtitles,
+  };
 }
 
 // Normalize flixhq's {lang, url} (or bare URL) tracks into proxy-ready
@@ -193,13 +263,23 @@ function normalizeFlixhqSubtitles(raw) {
   return out;
 }
 
-// flixhq: returns { urls, subtitles } or null when the source has nothing
-// for this title. The payload is {status, url, quality: "auto", subtitles}.
+// flixhq: returns { urls, subtitles } or null. Tries /flixhq then /purstream
+// (vidnest remapped "Beta" after /flixhq went dark on promox).
 export async function fetchFlixhqStreams(type, tmdb_id, season, episode, timeoutMs = 0) {
-  const payload = await fetchVidnestPayload(titlePath("flixhq", type, tmdb_id, season, episode), timeoutMs);
-  const url = typeof payload?.url === "string" ? payload.url.trim() : "";
-  if (!/^https?:\/\//i.test(url)) return null;
-  return { urls: [url], subtitles: normalizeFlixhqSubtitles(payload.subtitles) };
+  const payload = await fetchFirstBackend(
+    ["flixhq", "purstream"],
+    type,
+    tmdb_id,
+    season,
+    episode,
+    timeoutMs
+  );
+  const normalized = normalizeStreamPayload(payload);
+  if (!normalized?.urls?.length) return null;
+  return {
+    urls: normalized.urls,
+    subtitles: normalizeFlixhqSubtitles(normalized.subtitles),
+  };
 }
 
 // ophim: returns { urls, subtitles } (original-language first) or null. The
@@ -208,54 +288,67 @@ export async function fetchFlixhqStreams(type, tmdb_id, season, episode, timeout
 // does not ship subtitle tracks.
 export async function fetchOphimStreams(type, tmdb_id, season, episode, timeoutMs = 0) {
   const payload = await fetchVidnestPayload(titlePath("ophim", type, tmdb_id, season, episode), timeoutMs);
+  const normalized = normalizeStreamPayload(payload);
+  if (!normalized?.urls?.length) return null;
   const list = (Array.isArray(payload?.streams) ? payload.streams : [])
     .filter((s) => typeof s?.url === "string" && /^https?:\/\//i.test(s.url.trim()))
     .filter((s) => !s.type || /hls|m3u8/i.test(s.type));
   const original = list.filter((s) => /original|multi/i.test(s.language || ""));
   const chosen = original.length ? original : list;
-  return chosen.length ? { urls: chosen.map((s) => s.url.trim()), subtitles: [] } : null;
+  return chosen.length
+    ? { urls: chosen.map((s) => rewriteVidnestUrl(s.url.trim())), subtitles: [] }
+    : null;
 }
 
 async function lookupVidnestPayload(path, timeoutMs) {
-  const apiUrl = `${API_BASE}${path}?_n=${newNonce()}`;
   let json;
-  try {
-    json = await fetchJSON(apiUrl, timeoutMs);
-  } catch (directErr) {
-    if (!RELAY_PREFIXES.length) throw directErr;
-    // A 404/502 means the backend genuinely has nothing for the title (and
-    // may have taken 10s+ scraping to say so); a relay would only ask it
-    // the same question. Anything else (403 from the WAF, connection reset,
-    // timeout) is worth retrying via the relays, in order. A relay that
-    // answers 404/502 has reached vidnest and got its verdict — that is
-    // final; anything else means the relay itself is broken, so move on
-    // to the next one.
-    if (isNoEntry(directErr)) throw directErr;
-    const failures = [`direct: ${directErr.message}`];
-    let verdict = null;
-    for (const prefix of RELAY_PREFIXES) {
-      try {
-        json = await fetchJSON(
-          `${prefix}${encodeURIComponent(apiUrl)}`,
-          timeoutMs,
-          RELAY_KEY ? { "X-Relay-Key": RELAY_KEY } : undefined
-        );
-        break;
-      } catch (relayErr) {
-        failures.push(`relay ${new URL(prefix).host}: ${relayErr.message}`);
-        if (isNoEntry(relayErr)) {
-          verdict = relayErr.status;
+  const failures = [];
+  let verdict = null;
+  let lastErr = null;
+
+  // Try each API base (promox, then legacy new.*). 404/502 from a live host
+  // is a definitive "no entry" and stops the search; 5xx/WAF/network moves on.
+  for (const base of API_BASES) {
+    const apiUrl = `${base}${path}?_n=${newNonce()}`;
+    try {
+      json = await fetchJSON(apiUrl, timeoutMs);
+      break;
+    } catch (directErr) {
+      lastErr = directErr;
+      failures.push(`${new URL(base).host}: ${directErr.message}`);
+      if (isNoEntry(directErr) && !/522|523|521/.test(String(directErr.status))) {
+        // Real catalogue miss from a reachable host.
+        throw directErr;
+      }
+      // 522/523 = CF couldn't reach origin (dead host). Try next base / relay.
+      if (!RELAY_PREFIXES.length) continue;
+      for (const prefix of RELAY_PREFIXES) {
+        try {
+          json = await fetchJSON(
+            `${prefix}${encodeURIComponent(apiUrl)}`,
+            timeoutMs,
+            RELAY_KEY ? { "X-Relay-Key": RELAY_KEY } : undefined
+          );
           break;
+        } catch (relayErr) {
+          failures.push(`relay ${new URL(prefix).host}: ${relayErr.message}`);
+          if (isNoEntry(relayErr) && !/522|523|521/.test(String(relayErr.status))) {
+            verdict = relayErr.status;
+            break;
+          }
         }
       }
+      if (json || verdict) break;
     }
-    if (!json) {
-      const err = new Error(failures.join("; "));
-      // Keep the verdict so callers can tell "not in catalogue" from a
-      // transient failure.
-      if (verdict) err.status = verdict;
+  }
+
+  if (!json) {
+    if (verdict) {
+      const err = new Error(failures.join("; ") || "vidnest no entry");
+      err.status = verdict;
       throw err;
     }
+    throw lastErr || new Error(failures.join("; ") || "vidnest unreachable");
   }
 
   let payload = json;

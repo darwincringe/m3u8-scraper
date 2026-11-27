@@ -24,7 +24,11 @@
 
 // new.vidnest.fun = encrypted stream API; vidnest.fun = frontend/JS (needed
 // so the droplet can refresh the AES secret when Cloudflare blocks its IP).
-const ALLOWED_HOSTS = new Set(["new.vidnest.fun", "vidnest.fun"]);
+const ALLOWED_HOSTS = new Set([
+  "promox.vidnest.fun",
+  "new.vidnest.fun",
+  "vidnest.fun",
+]);
 
 export default {
   async fetch(request, env) {

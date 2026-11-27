@@ -26,6 +26,7 @@ import {
 } from "./utils/opensubtitles.js";
 import { registerSyncRoutes, requireAuth, requirePremium } from "./srctvSync.js";
 import { fetchCatflixStream, fetchFlixhqStreams, fetchOphimStreams } from "./utils/catflix.js";
+import { decryptVaplayerStreamUrls } from "./utils/vaplayerDecrypt.js";
 import { SocksProxyAgent } from "socks-proxy-agent";
 import { fetchMovyStreams, NASHVILLE_CITY } from "./utils/wecollege.js";
 import {
@@ -139,10 +140,31 @@ const UPSTREAM_HEADER_RULES = [
       Accept: "application/vnd.apple.mpegurl,application/x-mpegURL,*/*",
     },
   },
+  // vidnest /moviebox (Catflix fallback): manifests on bigbang.observer,
+  // subtitle API on embed.vidrift.net.
+  {
+    test: /(^|\.)(bigbang\.observer|vidrift\.net)$/i,
+    headers: {
+      Referer: "https://vidrift.net/",
+      Origin: "https://vidrift.net",
+      "User-Agent": BROWSER_UA,
+      Accept: "application/vnd.apple.mpegurl,application/x-mpegURL,*/*",
+    },
+  },
+  // vaplayer stream hosts (IP-bound ?token= on /pl/...).
+  {
+    test: /(^|\.)(scalableimpactgroup\.site)$/i,
+    headers: {
+      Referer: "https://nextgencloudfabric.com/",
+      Origin: "https://nextgencloudfabric.com",
+      "User-Agent": BROWSER_UA,
+      Accept: "application/vnd.apple.mpegurl,application/x-mpegURL,*/*",
+    },
+  },
 ];
 // Movy / wecollege CDNs hard-403 without the movy.sx Referer. Hostnames
-// rotate (finalsignal, goldenkite, pulseatom, …); known hosts + path heuristic
-// in upstreamHeadersFor cover the churn.
+// rotate (finalsignal, goldenkite, pulseatom, deepplaza, …); known hosts +
+// path heuristic in upstreamHeadersFor cover the churn.
 const MOVY_UPSTREAM_HEADERS = {
   Referer: "https://www.movy.sx/",
   Origin: "https://www.movy.sx",
@@ -151,7 +173,7 @@ const MOVY_UPSTREAM_HEADERS = {
     "application/vnd.apple.mpegurl,application/x-mpegURL,application/dash+xml,application/xml,*/*",
 };
 UPSTREAM_HEADER_RULES.push({
-  test: /(^|\.)(finalsignal\.top|goldenkite\.top|pulseatom\.top|greenkite\.top|vividstone\.top|keenatom\.top|wellsrobertsonkmlt\.workers\.dev)$/i,
+  test: /(^|\.)(finalsignal\.top|goldenkite\.top|pulseatom\.top|greenkite\.top|vividstone\.top|keenatom\.top|deepplaza\.top|wellsrobertsonkmlt\.workers\.dev)$/i,
   headers: MOVY_UPSTREAM_HEADERS,
 });
 // Everything else — vaplayer mirrors and the Cloudflare Workers fronting
@@ -216,13 +238,42 @@ function movyNeedsSocks(url) {
   }
 }
 
+function isVaplayerCdnHost(url) {
+  try {
+    return /(^|\.)(scalableimpactgroup\.site)$/i.test(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
+// Carry ?token= / ?cast_token= from a vaplayer master onto same-origin
+// segment/child URLs (their /pl/ hosts require it on every request).
+function inheritVaplayerToken(absUrl, parentUrl) {
+  try {
+    const parent = new URL(parentUrl);
+    const name = parent.searchParams.has("cast_token")
+      ? "cast_token"
+      : parent.searchParams.has("token")
+        ? "token"
+        : null;
+    if (!name) return absUrl;
+    const child = new URL(absUrl);
+    if (child.origin !== parent.origin) return absUrl;
+    if (child.searchParams.has("token") || child.searchParams.has("cast_token")) return absUrl;
+    child.searchParams.set(name, parent.searchParams.get(name));
+    return child.toString();
+  } catch {
+    return absUrl;
+  }
+}
+
 // Fetch an upstream URL with the right per-host / per-cdn headers and the
 // shared agent. `cdnHint` (e.g. "movy") wins over host heuristics.
 function fetchUpstream(url, init = {}) {
   const { cdnHint, headers: extraHeaders, ...rest } = init;
   const headers = { ...upstreamHeadersFor(url, cdnHint), ...(extraHeaders || {}) };
   const socks =
-    isMovyUpstream(url, cdnHint, headers) && movyNeedsSocks(url)
+    (isMovyUpstream(url, cdnHint, headers) && movyNeedsSocks(url)) || isVaplayerCdnHost(url)
       ? getMovySocksAgent()
       : null;
   return fetch(url, {
@@ -510,6 +561,9 @@ function appendReleaseParam(url) {
 async function fetchVaplayerJSON(apiUrl, timeoutMs = 0) {
   // No abort by default — cancelled mid-scrape left viewers with nothing and
   // no cache entry. timeoutMs > 0 still supported for optional callers.
+  // Prefer MOVY_SOCKS so api_token (minted on the same egress) matches the
+  // IP streamdata validates against; datacenter IPs often 404 the API or
+  // trip the nextgen captcha gate.
   const controller = timeoutMs > 0 ? new AbortController() : null;
   const timeout =
     controller && timeoutMs > 0
@@ -517,10 +571,10 @@ async function fetchVaplayerJSON(apiUrl, timeoutMs = 0) {
       : null;
   try {
     const res = await fetch(apiUrl, {
+      agent: getMovySocksAgent() || undefined,
       headers: {
         Referer: "https://nextgencloudfabric.com/",
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "User-Agent": BROWSER_UA,
       },
       ...(controller ? { signal: controller.signal } : {}),
     });
@@ -818,28 +872,138 @@ async function resolveTVEpisodeIndex(tmdb_id, season, episode) {
 }
 
 // vaplayer.ru exposes its stream data through a plain JSON API
-// (streamdata.vaplayer.ru). Its embed page's own JS aborts this same
-// request when it detects a CDP/debugger connection (i.e. any Playwright
-// browser), so we skip the browser entirely and hit the API directly.
-async function scrapeVaplayerAPI(type, tmdb_id, season, episode) {
-  console.log(`\nFetching stream data for tmdb_id=${tmdb_id}`);
-
-  const apiUrl =
+// (streamdata.vaplayer.ru). Since late 2026 the unauthenticated call only
+// returns metadata (+ cast_urls); real stream_urls require an IP-bound
+// api_token minted by the nextgencloudfabric embed (fetched via MOVY_SOCKS
+// when the droplet would otherwise hit the captcha gate).
+function vaplayerApiUrl(type, tmdb_id, season, episode, { streamUrls = false, apiToken = "" } = {}) {
+  const base =
     type === "tv"
       ? `https://streamdata.vaplayer.ru/api.php?tmdb=${tmdb_id}&type=tv&season=${season}&episode=${episode}`
       : `https://streamdata.vaplayer.ru/api.php?tmdb=${tmdb_id}&type=movie`;
+  let url = streamUrls ? `${base}&stream_urls` : base;
+  if (apiToken) url += `&api_token=${encodeURIComponent(apiToken)}`;
+  return url;
+}
+
+function normalizeVaplayerStreamList(raw) {
+  if (Array.isArray(raw)) {
+    return raw.filter((u) => typeof u === "string" && /^https?:\/\//i.test(u));
+  }
+  // Encrypted blob (vadec) — skip until we wire WASM decrypt.
+  if (typeof raw === "string" && /^https?:\/\//i.test(raw)) return [raw];
+  if (typeof raw === "string" && raw.includes("\n")) {
+    return raw
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((u) => /^https?:\/\//i.test(u));
+  }
+  return [];
+}
+
+async function mintVaplayerApiToken(type, tmdb_id, season, episode) {
+  const socks = getMovySocksAgent();
+  if (!socks) return "";
+  const path =
+    type === "tv"
+      ? `/embed/tv/${tmdb_id}/${season}/${episode}`
+      : `/embed/movie/${tmdb_id}`;
+  const wrap = await fetch(`https://vaplayer.ru/embed/va_src.php?path=${encodeURIComponent(path)}`, {
+    headers: {
+      Referer: `https://vaplayer.ru${path}`,
+      "User-Agent": BROWSER_UA,
+    },
+  });
+  if (!wrap.ok) return "";
+  const { src } = await wrap.json().catch(() => ({}));
+  if (typeof src !== "string" || !src.startsWith("http")) return "";
+  const emb = await fetch(src, {
+    agent: socks,
+    headers: {
+      Referer: "https://vaplayer.ru/",
+      "User-Agent": BROWSER_UA,
+      "Cache-Control": "no-cache",
+    },
+  });
+  if (!emb.ok) return "";
+  const html = await emb.text();
+  if (html.includes("VA_CST")) return ""; // captcha gate
+  const m = html.match(/"apiToken":"([^"]+)"/);
+  return m?.[1] || "";
+}
+
+async function fetchVaplayerStreamData(type, tmdb_id, season, episode) {
+  const socks = getMovySocksAgent();
+  const agentOpts = socks
+    ? {
+        agent: socks,
+        headers: { Referer: "https://nextgencloudfabric.com/", "User-Agent": BROWSER_UA },
+      }
+    : {
+        headers: { Referer: "https://nextgencloudfabric.com/", "User-Agent": BROWSER_UA },
+      };
+
+  let lastErr = null;
+  // SOCKS egress IP rotates; apiToken is IP-bound. A couple of mint+fetch
+  // attempts usually lands a matching pair.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let apiToken = "";
+    try {
+      apiToken = await mintVaplayerApiToken(type, tmdb_id, season, episode);
+    } catch (err) {
+      lastErr = err;
+      continue;
+    }
+    if (!apiToken) {
+      lastErr = new Error("no apiToken (captcha or SOCKS down)");
+      continue;
+    }
+    try {
+      let json = await fetchVaplayerJSON(
+        vaplayerApiUrl(type, tmdb_id, season, episode, { streamUrls: true, apiToken }),
+        0
+      );
+      if (json?.status_code && String(json.status_code) !== "200") {
+        throw new Error(json.error || `streamdata status ${json.status_code}`);
+      }
+      json = await decryptVaplayerStreamUrls(json, agentOpts);
+      const streamUrls = normalizeVaplayerStreamList(json?.data?.stream_urls);
+      if (!streamUrls.length) throw new Error("No stream URLs after decrypt");
+
+      // Stamp per-host playback token when generate.php accepts our apiToken.
+      const stamped = [];
+      const hostTokCache = new Map();
+      for (const url of streamUrls) {
+        try {
+          const origin = new URL(url).origin;
+          let hostTok = hostTokCache.get(origin);
+          if (hostTok === undefined) {
+            const gen = await fetch(`${origin}/generate.php?api_token=${encodeURIComponent(apiToken)}`, {
+              agent: socks || undefined,
+              headers: { Referer: `${origin}/`, "User-Agent": BROWSER_UA },
+            });
+            const text = gen.ok ? (await gen.text()).trim() : "";
+            hostTok = text.startsWith("eyJ") ? text : "";
+            hostTokCache.set(origin, hostTok);
+          }
+          stamped.push(hostTok ? `${url}${url.includes("?") ? "&" : "?"}token=${hostTok}` : url);
+        } catch {
+          stamped.push(url);
+        }
+      }
+      return { json, streamUrls: stamped, apiToken };
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error("vaplayer streamdata failed");
+}
+
+async function scrapeVaplayerAPI(type, tmdb_id, season, episode) {
+  console.log(`\nFetching stream data for tmdb_id=${tmdb_id}`);
 
   try {
-    // The API itself answers in well under a second normally; give it
-    // longer than the default so a busy moment doesn't lose every mirror.
-    const json = await fetchVaplayerJSON(apiUrl, 0).catch((err) => {
-      throw new Error(`streamdata API: ${err.message}`);
-    });
-    const streamUrls = json?.data?.stream_urls;
-
-    if (!Array.isArray(streamUrls) || streamUrls.length === 0) {
-      throw new Error("No stream URLs returned");
-    }
+    const { json, streamUrls } = await fetchVaplayerStreamData(type, tmdb_id, season, episode);
 
     const streams = await probeStreamUrls(streamUrls, PROBE_TIMEOUT_MS, PROBE_ATTEMPTS);
     if (streams.length === 0) {
@@ -888,9 +1052,20 @@ async function scrapeCatflix(type, tmdb_id, season, episode) {
     if (!stream) return { streams: [], subtitles: [], transient: false };
     const streams = await probeStreamUrls([stream.url], PROBE_TIMEOUT_MS, PROBE_ATTEMPTS);
     if (!streams.length) console.warn(`[catflix] manifest unreachable: ${stream.url.slice(0, 80)}…`);
+    const subtitles = Array.isArray(stream.subtitles)
+      ? stream.subtitles
+          .map((s) => {
+            const url = typeof s === "string" ? s : s?.url;
+            if (typeof url !== "string" || !/^https?:\/\//i.test(url)) return null;
+            const lang = (typeof s === "object" && s?.lang ? String(s.lang) : "und").toLowerCase();
+            const sep = url.includes("?") ? "&" : "?";
+            return `${url}${sep}release=${encodeURIComponent(`catflix.${lang}`)}`;
+          })
+          .filter(Boolean)
+      : [];
     return {
       streams: streams.map((s) => ({ ...s, source: "catflix" })),
-      subtitles: [],
+      subtitles,
       transient: streams.length === 0,
     };
   } catch (error) {
@@ -1518,8 +1693,10 @@ app.get("/hls-proxy", async (req, res) => {
       // #EXT-X-MAP:URI="..." — and AES streams a key via #EXT-X-KEY — which
       // must come through here too, or browsers hit a worker with no CORS.
       const childSuffix = isMaster ? `&variant=1${cdnQS}` : cdnQS;
-      const proxyUrl = (ref, suffix = "") =>
-        `/hls-proxy?url=${encodeURIComponent(new URL(ref, baseUrl).toString())}${suffix}`;
+      const proxyUrl = (ref, suffix = "") => {
+        const abs = inheritVaplayerToken(new URL(ref, baseUrl).toString(), target);
+        return `/hls-proxy?url=${encodeURIComponent(abs)}${suffix}`;
+      };
       const rewritten = text
         .split("\n")
         .map((line) => {
@@ -1981,10 +2158,16 @@ async function buildExtractResponse({
     }
 
     const proxied = (s) => {
+      // flixhq's purstream fallback wraps Movy CDNs; stamp cdn=movy so
+      // playlist→segment hops keep the movy Referer + SOCKS. Catflix only
+      // needs the animanga hint for yflix — moviebox uses host rules.
+      const isMovyWrapped =
+        /\/movy\/pl\//i.test(s.url) ||
+        /\.(top)\/(vd|vdb|r6|fine|res)\b/i.test(s.url);
       const cdn =
-        s.source === "movy" || s.source === "nashville"
+        s.source === "movy" || s.source === "nashville" || (s.source === "flixhq" && isMovyWrapped)
           ? "&cdn=movy"
-          : s.source === "catflix"
+          : s.source === "catflix" && /animanga\.fun|tiktokcdn\.com/i.test(s.url)
             ? "&cdn=catflix"
             : "";
       return `${origin}/hls-proxy?url=${encodeURIComponent(s.url)}${cdn}`;

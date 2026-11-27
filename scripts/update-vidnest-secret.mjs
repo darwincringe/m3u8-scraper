@@ -96,8 +96,10 @@ async function findSecretFromBundle() {
     } catch {
       continue;
     }
-    // Secret sits next to new.vidnest.fun in the decrypt helper chunk.
-    if (!js.includes("new.vidnest.fun") || !/decryptCipherResponse|AES-GCM|aes-256-gcm/i.test(js)) {
+    // Secret sits next to the API base URL in the decrypt helper chunk.
+    const hasApiHost =
+      js.includes("promox.vidnest.fun") || js.includes("new.vidnest.fun");
+    if (!hasApiHost || !/decryptCipherResponse|AES-GCM|aes-256-gcm/i.test(js)) {
       continue;
     }
     for (const m of js.matchAll(/["']([A-Za-z0-9_-]{40,90})["']/g)) {
@@ -108,7 +110,10 @@ async function findSecretFromBundle() {
       if (letters >= 20 && digits >= 4) candidates.add(s);
     }
     // Prefer the assignment right before the API base URL.
-    const near = /let \w+="([A-Za-z0-9_-]{40,90})",\w+="https:\/\/new\.vidnest\.fun"/.exec(js);
+    const near =
+      /let \w+="([A-Za-z0-9_-]{40,90})",\w+="https:\/\/(?:promox|new)\.vidnest\.fun"/.exec(
+        js
+      );
     if (near) return { secret: near[1], chunk, candidates: [...candidates] };
   }
   if (candidates.size === 1) {
@@ -132,7 +137,7 @@ function decryptV2(d, n, secret) {
 
 async function fetchEncryptedSample() {
   const nonce = crypto.randomBytes(16).toString("base64url");
-  const apiUrl = `https://new.vidnest.fun/ophim/movie/550?_n=${nonce}`;
+  const apiUrl = `https://promox.vidnest.fun/ophim/movie/550?_n=${nonce}`;
   const relay = (process.env.CATFLIX_RELAY || "").split(",")[0].trim();
   const relayKey = process.env.CATFLIX_RELAY_KEY || "";
 
